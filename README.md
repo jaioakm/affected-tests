@@ -71,11 +71,11 @@ Action matrix (situation → action [source]):
 
 Emits the same decision trace as a single-line JSON object on `lifecycle()` instead of the human-readable text block. Designed for dashboard / telemetry pipelines that previously had to regex-parse the text trace and broke whenever the trace shape evolved.
 
-Schema (carried in the `version` field; new fields will be added additively while `version` stays at `1`):
+Schema (carried in the `version` field; new fields may be added additively while `version` stays at `2`):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "baseRef": "origin/master",
   "mode": {"configured": "AUTO", "effective": "LOCAL"},
   "changedFiles": 3,
@@ -89,6 +89,15 @@ Schema (carried in the `version` field; new fields will be added additively whil
   "action": {"name": "FULL_SUITE", "source": "MODE_DEFAULT"},
   "outcome": {"kind": "FULL_SUITE", "selectedClassCount": 0, "escalationReason": "RUN_ALL_ON_NON_JAVA_CHANGE"},
   "modules": [],
+  "discovery": {
+    "parallelEnabled": true,
+    "concurrencyLevel": 4,
+    "totalMillis": 13,
+    "perStrategy": [
+      {"name": "naming", "millis": 2, "tests": 2},
+      {"name": "transitive", "millis": 11, "tests": 3}
+    ]
+  },
   "actionMatrix": {
     "EMPTY_DIFF":              {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
     "ALL_FILES_IGNORED":       {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
@@ -115,7 +124,10 @@ Field-by-field semantics:
 | `action` | object | `name` is one of `SELECTED` / `FULL_SUITE` / `SKIPPED`; `source` says which configuration tier resolved it (`MODE_DEFAULT` / `EXPLICIT`). |
 | `outcome` | object | `kind` mirrors `action.name`; `selectedClassCount` is meaningful on `SELECTED` runs (and `0` elsewhere); `escalationReason` is the same enum the text trace renders in the `Outcome:` line. |
 | `modules` | array | One entry per dispatched `:module:test` task (empty on non-`SELECTED` runs). Each entry carries the canonical task path and the full FQN list — no truncation, since this is the actionable downstream-routing surface. |
+| `discovery` | object | Always present. Carries discovery execution metadata: whether parallel discovery was enabled, the configured concurrency level, total discovery wall time in milliseconds, and per-strategy `{name, millis, tests}` entries. Empty-diff / test-only fast paths emit zero defaults and an empty `perStrategy` array. |
 | `actionMatrix` | object | Every `Situation` enum value maps to its `{action, source}` pair. Pinned in tests so a future engine that adds a situation also has to update the JSON renderer. |
+
+Fields may be added without bumping `version`. Removing or renaming fields, changing field types, or changing existing field semantics requires a version bump. Consumers should parse defensively by ignoring unknown fields.
 
 The text format remains the default — JSON is opt-in. Switching format never invalidates a Gradle cached execution because `--explain-format` only changes lifecycle logging, never the set of tests Gradle would actually run.
 

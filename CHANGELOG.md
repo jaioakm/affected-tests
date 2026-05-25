@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Synced the README `--explain --explain-format=json` sample with
+  the shipped schema v2 output, including the additive `discovery`
+  block and schema-versioning policy for consumers (issue #104).
+
 ### Added — Phase 3 Groovy AST tech plan (issue #96 / #47)
 
 `docs/PHASE-3-GROOVY-AST.md` lays out the plan for making Groovy a
