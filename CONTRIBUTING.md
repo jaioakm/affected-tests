@@ -17,7 +17,9 @@ contributions help the plugin compound:
 | **Performance fix with a measurement** | Low — bring a `time ./gradlew affectedTest --explain` before/after, or a JMH delta if the change is in a hot loop. Numbers carry the change. |
 | **New discovery strategy** | Medium — open an issue first to agree on the situation/action wiring. The four existing strategies (naming, usage, impl, transitive) cover the common cases; a fifth one needs a justification an adopter can map to a real diff. |
 | **Mode profile change, default flip** | High — open an issue first. A mode default is a behaviour change for every adopter on `mode = 'auto'`, so the discussion is "what does this break?", not "is this code correct?" |
-| **Kotlin/Groovy/Scala source mapping** | Tracked in #47 — a Phase-1 docs PR is welcome any time; Phase-2 (real mapping support) needs a tech plan. |
+| **Kotlin source mapping** | Phase 2 shipped in #76. Follow-up hardening is tracked in #102 (`@file:JvmName`), #103 (sealed-class permits), and #117 (typealias + KMP expect/actual). |
+| **Groovy source mapping** | Active epic: #96 (`help wanted`). Tech plan landed in PR #97; implementation tracks in #98, #99, and #100. |
+| **Scala source mapping** | Tracking placeholder: #111 (awaiting adopter signal; currently no active implementation plan). |
 
 ## How to set up locally
 

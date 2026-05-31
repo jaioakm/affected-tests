@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated `CONTRIBUTING.md` source-language guidance to remove stale
+  routing to closed #47 and point contributors to the current Kotlin
+  (#102, #103, #117), Groovy (#96, PRs #97/#98/#99/#100), and Scala
+  (#111) tracking threads (issue #122).
+
 ### Added — `headerEdges` discovery strategy (issue #132)
 
 Adds a fifth, default-on discovery strategy that closes the Spring DI
