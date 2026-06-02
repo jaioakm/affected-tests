@@ -203,8 +203,11 @@ class ProjectIndexCacheStage2Test {
         Path snapshot = projectDir.resolve("build/affected-tests/index/v1/snapshot.tsv");
         assertTrue(Files.isRegularFile(snapshot));
         String contents = Files.readString(snapshot);
-        assertTrue(contents.contains("v\t4"),
-                "Persisted snapshot must declare current schema version (4 since PR #3 of issue #76)");
+        assertTrue(contents.contains("v\t6"),
+                "Persisted snapshot must declare current schema version (6 since "
+                        + "issue #132's nested-decl FQN follow-up bumped 5 → 6 to add "
+                        + "the qualified-name disambiguator to the decls column and "
+                        + "switch the header-edges key from simpleName to qualifiedName)");
 
         ProjectIndex second = ProjectIndex.build(projectDir, BASE_CONFIG);
         assertEquals(first.testFqns(), second.testFqns(),

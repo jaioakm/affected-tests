@@ -52,8 +52,9 @@ class AffectedTestsPluginTest {
                 "Default must be COMMITTED-ONLY so local runs match CI — WIP inclusion is an explicit opt-in");
         assertFalse(ext.getIncludeStaged().get(),
                 "Default must be COMMITTED-ONLY so local runs match CI — staged-index inclusion is an explicit opt-in");
-        assertEquals(4, ext.getStrategies().get().size());
+        assertEquals(5, ext.getStrategies().get().size());
         assertTrue(ext.getStrategies().get().contains("transitive"));
+        assertTrue(ext.getStrategies().get().contains("headerEdges"));
         // v2 raises the default transitive depth from 2 to 4 — real-world
         // ctrl -> svc -> repo -> mapper chains sit at 3-4 levels, so 2
         // silently dropped coverage on zero-config installs.

@@ -36,6 +36,42 @@ public final class AffectedTestsConfig {
     public static final String STRATEGY_USAGE = "usage";
     public static final String STRATEGY_IMPL = "impl";
     public static final String STRATEGY_TRANSITIVE = "transitive";
+    /**
+     * Issue&nbsp;#132 — header-edges discovery strategy. Walks
+     * class-header type references (extends, implements, permits,
+     * generic bounds, record components, class-level annotations)
+     * from a changed concrete type up to its supertypes and out
+     * to its header-declared types, then runs the resulting
+     * augmented changed-class set through the existing four
+     * strategies. Closes the dominant Spring DI gap where a single
+     * impl change otherwise misses the interface's consumer tests.
+     */
+    public static final String STRATEGY_HEADER_EDGES = "headerEdges";
+
+    /**
+     * Canonical category names for the {@code headerEdgesExclude}
+     * opt-out list. Adopters disable a category by listing its
+     * canonical name (case-insensitive); unknown entries are
+     * rejected at the builder gate so a typo doesn't silently
+     * disable nothing.
+     */
+    public static final String HEADER_EDGE_EXTENDS = "extends";
+    public static final String HEADER_EDGE_IMPLEMENTS = "implements";
+    public static final String HEADER_EDGE_PERMITS = "permits";
+    public static final String HEADER_EDGE_TYPE_BOUNDS = "type-bounds";
+    public static final String HEADER_EDGE_RECORD_COMPONENTS = "record-components";
+    public static final String HEADER_EDGE_ANNOTATIONS = "annotations";
+
+    /**
+     * The complete set of valid {@code headerEdgesExclude} entries.
+     * Builder validates against this so misspellings ({@code
+     * "implments"}, {@code "type-bound"}) fail loudly at config
+     * time rather than silently disabling no category.
+     */
+    private static final Set<String> VALID_HEADER_EDGE_CATEGORIES = Set.of(
+            HEADER_EDGE_EXTENDS, HEADER_EDGE_IMPLEMENTS, HEADER_EDGE_PERMITS,
+            HEADER_EDGE_TYPE_BOUNDS, HEADER_EDGE_RECORD_COMPONENTS,
+            HEADER_EDGE_ANNOTATIONS);
 
     private final String baseRef;
     private final boolean includeUncommitted;
@@ -58,6 +94,11 @@ public final class AffectedTestsConfig {
     private final Map<Situation, ActionSource> situationActionSources;
     private final boolean parallelDiscovery;
     private final boolean kotlinEnabled;
+    private final boolean headerEdgesEnabled;
+    private final Set<String> headerEdgesExclude;
+    private final int headerEdgesDepth;
+    private final int headerEdgesMaxSiblings;
+    private final List<String> headerEdgesIgnore;
 
     private AffectedTestsConfig(Builder builder) {
         this.baseRef = builder.baseRef;
@@ -94,6 +135,11 @@ public final class AffectedTestsConfig {
         this.situationActionSources = resolved.sources;
         this.parallelDiscovery = builder.parallelDiscovery;
         this.kotlinEnabled = builder.kotlinEnabled;
+        this.headerEdgesEnabled = builder.headerEdgesEnabled;
+        this.headerEdgesExclude = Set.copyOf(builder.headerEdgesExclude);
+        this.headerEdgesDepth = builder.headerEdgesDepth;
+        this.headerEdgesMaxSiblings = builder.headerEdgesMaxSiblings;
+        this.headerEdgesIgnore = List.copyOf(builder.headerEdgesIgnore);
     }
 
     /** Parallel pair returned from the situation-action resolver. */
@@ -244,6 +290,127 @@ public final class AffectedTestsConfig {
      * @return whether Kotlin AST parsing is enabled for this run
      */
     public boolean kotlinEnabled() { return kotlinEnabled; }
+
+    /**
+     * Issue&nbsp;#132 — whether the {@code headerEdges} discovery
+     * strategy participates in this run. Defaults to {@code true}.
+     * The strategy walks from each changed concrete production
+     * class up to its supertypes (extends, implements, permits)
+     * and out to its header-declared types (generic bounds, record
+     * components, class-level annotations), adding the resulting
+     * types to the changed-class set that the four existing
+     * strategies (naming, usage, impl, transitive) consume.
+     *
+     * <p>One-flag kill switch — {@code false} disables every
+     * category at once and reverts plugin behaviour to byte-for-byte
+     * identical to pre-issue-#132. Adopters who want per-category
+     * opt-out use {@link #headerEdgesExclude()} instead so the rest
+     * of the strategy keeps firing.
+     *
+     * <p>The flag itself doesn't gate strategy registration — the
+     * strategy is wired unconditionally into the engine and
+     * short-circuits to "augmented set = original set, zero
+     * diagnostic edges" when this is {@code false}, so the
+     * cache-hash impact (knob participates in
+     * {@link io.affectedtests.core.discovery.ProjectIndexCache#configHash})
+     * is bounded to "off vs on" and not "every category combination".
+     */
+    public boolean headerEdgesEnabled() { return headerEdgesEnabled; }
+
+    /**
+     * Issue&nbsp;#132 — canonical category names whose header-edge
+     * contributions are skipped during augmentation. Adopters
+     * exclude (not include) — every category is on by default; the
+     * exclude list is the surgical opt-out. Valid entries are the
+     * {@code HEADER_EDGE_*} constants on this class; unknown
+     * entries are rejected at the builder gate.
+     *
+     * <p>Common opt-out shapes:
+     * <ul>
+     *   <li>{@code ["annotations"]} — adopter uses many custom
+     *       class-level annotations that don't carry test-relevant
+     *       behaviour. Most frequent opt-out.</li>
+     *   <li>{@code ["record-components"]} — DTO-heavy codebases
+     *       where record components are pure data carriers.</li>
+     * </ul>
+     *
+     * <p>Defaults to empty (every category contributes). When this
+     * set contains an entry, the strategy still records the edge in
+     * the {@code --explain} side-channel with
+     * {@code status = IGNORED_BY_CATEGORY} so adopters can tell
+     * what the opt-out cost them.
+     */
+    public Set<String> headerEdgesExclude() { return headerEdgesExclude; }
+
+    /**
+     * Issue&nbsp;#132 — how many header-edge hops the strategy
+     * walks from each changed class. {@code 1} (default) is the
+     * recommended setting: walk the immediate header-declared types
+     * only. {@code 2} walks one more level (the supertypes' own
+     * supertypes), and is clamped at the upper bound — higher
+     * values rapidly approach {@code FULL_SUITE} selection on
+     * real codebases because almost every concrete class transitively
+     * reaches {@code Object}'s consumer base.
+     *
+     * <p>Clamped to {@code [0, 2]} at the builder gate. Zero is
+     * a degenerate setting — the augmented set equals the
+     * original set — and is treated as identical to
+     * {@code headerEdgesEnabled = false}.
+     */
+    public int headerEdgesDepth() { return headerEdgesDepth; }
+
+    /**
+     * Issue&nbsp;#132 — sibling-cap on the explosion vector. When
+     * a header-edge-added type has more direct subtypes than this
+     * value, the {@code impl} strategy's downward walk from THAT
+     * added type is suppressed; the added type still contributes
+     * via naming / usage / transitive.
+     *
+     * <p>Motivating case: {@code PaymentController extends
+     * BaseController}, with {@code BaseController} owning 52
+     * subclasses. Without the cap, walking {@code extends} would
+     * add {@code BaseController} to the changed set and the impl
+     * strategy would then walk DOWN through all 52 subtypes,
+     * selecting every {@code *ControllerTest} in the codebase.
+     * The cap is the surgical fix: {@code BaseController} still
+     * adds {@code BaseControllerTest} via naming, but the 52-way
+     * fan-out is skipped.
+     *
+     * <p>Default: {@code 5}. Adopters with deep inheritance
+     * hierarchies (test bases, abstract DAO bases) typically keep
+     * this default; the {@code --explain} JSON surfaces every
+     * skipped fan-out so it's an evidence-driven tune.
+     *
+     * <p>Set to {@code 0} to suppress every downward walk from a
+     * header-edge-added type — useful in adopters whose hierarchies
+     * are universally fan-out-heavy. Setting it negative is
+     * rejected at the builder gate.
+     */
+    public int headerEdgesMaxSiblings() { return headerEdgesMaxSiblings; }
+
+    /**
+     * Issue&nbsp;#132 — globs (Java-style {@code **}-prefixed FQN
+     * patterns) for types whose header-edge contributions are
+     * ignored. The default list covers framework / standard-library
+     * types that pollute selection without contributing signal:
+     * {@code java.lang.**}, {@code java.util.**},
+     * {@code org.springframework.**}, {@code org.junit.**},
+     * {@code lombok.**}, {@code kotlin.**}, {@code groovy.lang.**},
+     * and the {@code javax} / {@code jakarta} equivalents.
+     *
+     * <p>Globs match against the simple name's resolved FQN — so
+     * {@code @Service class FooService} only ignores the
+     * {@code Service} annotation if the strategy resolves it to
+     * {@code org.springframework.stereotype.Service}; an
+     * adopter-defined {@code @Service} under
+     * {@code com.example.Service} would still contribute.
+     *
+     * <p>Adopters typically extend the default rather than replace
+     * it — the Gradle DSL wiring uses the builder default whenever
+     * the user-set list is null.
+     */
+    public List<String> headerEdgesIgnore() { return headerEdgesIgnore; }
+
     public List<String> testSuffixes() { return testSuffixes; }
     public List<String> sourceDirs() { return sourceDirs; }
     public List<String> testDirs() { return testDirs; }
@@ -420,6 +587,60 @@ public final class AffectedTestsConfig {
                 "*.gif", "**/*.gif"
         );
 
+        /**
+         * Issue&nbsp;#132 — default ignore globs for the headerEdges
+         * strategy. Every entry is a FQN-glob (Java-style
+         * {@code **}-suffixed) matched against the RESOLVED FQN of
+         * each candidate header-edge target. The list covers the
+         * framework / standard-library types that historically
+         * polluted selection without contributing signal:
+         * <ul>
+         *   <li>JDK ({@code java.**}, {@code javax.**},
+         *       {@code jakarta.**})</li>
+         *   <li>Spring ({@code org.springframework.**}) — its
+         *       stereotypes ({@code @Service}, {@code @Component})
+         *       and base classes are pure framework glue, not the
+         *       adopter's behaviour.</li>
+         *   <li>JUnit / Mockito ({@code org.junit.**},
+         *       {@code org.mockito.**}) — adopters writing tests
+         *       against the test framework itself are vanishingly
+         *       rare.</li>
+         *   <li>Lombok ({@code lombok.**}) — annotation-driven
+         *       code generation; the generated members participate
+         *       through their concrete shapes, not through Lombok's
+         *       own marker annotations.</li>
+         *   <li>Kotlin / Groovy stdlib ({@code kotlin.**},
+         *       {@code groovy.lang.**}) — same JDK-equivalent
+         *       reasoning.</li>
+         * </ul>
+         *
+         * <p>Adopters EXTEND (not replace) — the setter merges the
+         * user-supplied list with this default by default. Adopters
+         * who genuinely want to OVERRIDE pass their own list to
+         * {@code headerEdgesIgnore(...)} explicitly; that path
+         * surfaces the full picture in {@code --explain}.
+         */
+        static final List<String> DEFAULT_HEADER_EDGES_IGNORE = List.of(
+                "java.lang.**",
+                "java.util.**",
+                "java.io.**",
+                "java.time.**",
+                "java.math.**",
+                "java.nio.**",
+                "java.text.**",
+                "javax.**",
+                "jakarta.**",
+                "org.springframework.**",
+                "org.springframework.boot.**",
+                "org.springframework.data.**",
+                "org.junit.**",
+                "org.mockito.**",
+                "lombok.**",
+                "kotlin.**",
+                "kotlinx.**",
+                "groovy.lang.**"
+        );
+
         private String baseRef = "origin/master";
         // Committed-only by default: the plugin's question is "what
         // tests does *this commit* touch?", not "what tests does this
@@ -431,7 +652,16 @@ public final class AffectedTestsConfig {
         // want WIP to expand the diff opt in via {@code includeUncommitted(true)}.
         private boolean includeUncommitted = false;
         private boolean includeStaged = false;
-        private Set<String> strategies = Set.of(STRATEGY_NAMING, STRATEGY_USAGE, STRATEGY_IMPL, STRATEGY_TRANSITIVE);
+        // Issue #132 ships headerEdges as a default-on strategy.
+        // The DSL knob {@code headerEdgesEnabled = false} is the
+        // documented one-flag kill switch (keeps the strategy in
+        // the list but short-circuits at runtime), so dropping
+        // "headerEdges" from the strategies list explicitly is
+        // the secondary opt-out for adopters who want surgical
+        // strategy-by-strategy disablement (mirrors how Phase 2
+        // adopters could drop "transitive" or any other entry).
+        private Set<String> strategies = Set.of(STRATEGY_NAMING, STRATEGY_USAGE,
+                STRATEGY_IMPL, STRATEGY_TRANSITIVE, STRATEGY_HEADER_EDGES);
         // 4 matches the v2 design: most real-world ctrl -> svc -> repo ->
         // mapper chains are 2-3 deep, so 4 leaves headroom without
         // exploding discovery cost. Callers can still clamp back to 2
@@ -478,6 +708,19 @@ public final class AffectedTestsConfig {
         // --explain strings let adopters audit the AST path on
         // every run.
         private boolean kotlinEnabled = true;
+
+        // Issue #132 — headerEdges discovery strategy defaults.
+        // Default ON, all six categories enabled, depth=1 (immediate
+        // header types only), sibling cap=5 (suppress impl downward
+        // walk when an added type has >5 direct subtypes). The
+        // ignore-globs default to the framework / JDK / Lombok /
+        // JUnit / Kotlin / Groovy set adopters extend (not replace) —
+        // see the README for the rationale on each entry.
+        private boolean headerEdgesEnabled = true;
+        private Set<String> headerEdgesExclude = Set.of();
+        private int headerEdgesDepth = 1;
+        private int headerEdgesMaxSiblings = 5;
+        private List<String> headerEdgesIgnore = DEFAULT_HEADER_EDGES_IGNORE;
 
         private Mode mode;
         private Action onEmptyDiff;
@@ -613,6 +856,85 @@ public final class AffectedTestsConfig {
          * @see AffectedTestsConfig#kotlinEnabled()
          */
         public Builder kotlinEnabled(boolean v) { this.kotlinEnabled = v; return this; }
+
+        /** @see AffectedTestsConfig#headerEdgesEnabled() */
+        public Builder headerEdgesEnabled(boolean v) {
+            this.headerEdgesEnabled = v;
+            return this;
+        }
+
+        /**
+         * Sets the list of header-edge categories to opt out of.
+         * Entries are case-insensitive and validated against the
+         * canonical set {@code (extends, implements, permits,
+         * type-bounds, record-components, annotations)}. Unknown
+         * entries are rejected — silently ignoring a typo would
+         * leave the adopter expecting their opt-out applied when
+         * it didn't.
+         *
+         * @see AffectedTestsConfig#headerEdgesExclude()
+         */
+        public Builder headerEdgesExclude(Set<String> v) {
+            Objects.requireNonNull(v, "headerEdgesExclude must not be null");
+            Set<String> normalised = new java.util.LinkedHashSet<>();
+            for (String entry : v) {
+                if (entry == null || entry.isBlank()) {
+                    throw new IllegalArgumentException(
+                            "headerEdgesExclude entries must be non-blank.");
+                }
+                String lower = entry.toLowerCase(java.util.Locale.ROOT);
+                if (!VALID_HEADER_EDGE_CATEGORIES.contains(lower)) {
+                    throw new IllegalArgumentException(
+                            "headerEdgesExclude entry '" + LogSanitizer.sanitize(entry)
+                                    + "' is not a known category. Valid entries: "
+                                    + VALID_HEADER_EDGE_CATEGORIES);
+                }
+                normalised.add(lower);
+            }
+            this.headerEdgesExclude = normalised;
+            return this;
+        }
+
+        /**
+         * Clamps to {@code [0, 2]} — values outside the range silently
+         * pin to the boundary. The plan-side rationale lives on
+         * {@link AffectedTestsConfig#headerEdgesDepth()}: depths
+         * above 2 rapidly approach full-suite selection on real
+         * codebases.
+         *
+         * @see AffectedTestsConfig#headerEdgesDepth()
+         */
+        public Builder headerEdgesDepth(int v) {
+            this.headerEdgesDepth = Math.max(0, Math.min(v, 2));
+            return this;
+        }
+
+        /**
+         * Rejects negative values — there is no such thing as a
+         * negative sibling cap, and clamping to zero would hide a
+         * misconfigured DSL expression. {@code 0} is the legitimate
+         * "suppress every downward walk from added types"
+         * configuration.
+         *
+         * @see AffectedTestsConfig#headerEdgesMaxSiblings()
+         */
+        public Builder headerEdgesMaxSiblings(int v) {
+            if (v < 0) {
+                throw new IllegalArgumentException(
+                        "headerEdgesMaxSiblings must be >= 0; got " + v);
+            }
+            this.headerEdgesMaxSiblings = v;
+            return this;
+        }
+
+        /**
+         * @see AffectedTestsConfig#headerEdgesIgnore()
+         */
+        public Builder headerEdgesIgnore(List<String> v) {
+            this.headerEdgesIgnore = Objects.requireNonNull(v,
+                    "headerEdgesIgnore must not be null");
+            return this;
+        }
         public Builder testSuffixes(List<String> v) {
             this.testSuffixes = Objects.requireNonNull(v, "testSuffixes must not be null");
             return this;

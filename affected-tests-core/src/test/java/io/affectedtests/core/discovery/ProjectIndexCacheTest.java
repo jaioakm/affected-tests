@@ -397,22 +397,248 @@ class ProjectIndexCacheTest {
 
         Path cacheDir = projectDir.resolve("build/affected-tests/index/v1");
         Files.createDirectories(cacheDir);
-        // Hand-rolled v=5 snapshot. Body is deliberately stale (no
+        // Hand-rolled v=7 snapshot. Body is deliberately stale (no
         // testFqn entries); a permissive {@code <} check would
         // adopt this and downstream strategies would silently
-        // under-select FooTest.
+        // under-select FooTest. v=7 chosen because v=6 is now the
+        // current schema (bumped in issue #132's nested-decl FQN
+        // follow-up for the QName disambiguator) — the next forward
+        // bump will rotate this canary to v=8 + the bump's body
+        // description.
+        Files.writeString(cacheDir.resolve("snapshot.tsv"),
+                "v\t7\ncfg\twillbeoverwritten\n");
+
+        ProjectIndex index = ProjectIndex.build(projectDir, BASE_CONFIG);
+
+        assertTrue(index.testFqns().contains("com.example.FooTest"),
+                "Test FQN must surface from the rescan when a v=7 "
+                        + "future-schema snapshot exists. The schemaVersion "
+                        + "check at tryLoad must reject the v=7 snapshot — "
+                        + "downgrade across a CI matrix boundary cannot "
+                        + "feed future-shaped rows to a current-shaped "
+                        + "reader. Got: " + index.testFqns());
+    }
+
+    @Test
+    void prePr5SchemaSnapshotInvalidatesAndForcesFullRescan() throws Exception {
+        // Issue #132: bumped SCHEMA_VERSION 4 → 5 (HeaderEdges column
+        // added to FileMetadataRow) and then 5 → 6 (nested-decl FQN
+        // follow-up: qualified-name disambiguator added to the decls
+        // column; header-edges key switched from simpleName to
+        // qualifiedName). A v=4 OR v=5 snapshot's rows are
+        // wire-incompatible with the current reader; a permissive
+        // schema check would adopt the stale rows and downstream
+        // strategies would silently see either no header edges or
+        // mis-keyed header edges, producing a "headerEdges
+        // mis-attributes on warm caches but works on cold caches"
+        // silent bug class on the upgrade boundary. Pin the rejection.
+        writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
+                "package com.example; public class FooTest {}");
+
+        Path cacheDir = projectDir.resolve("build/affected-tests/index/v1");
+        Files.createDirectories(cacheDir);
         Files.writeString(cacheDir.resolve("snapshot.tsv"),
                 "v\t5\ncfg\twillbeoverwritten\n");
 
         ProjectIndex index = ProjectIndex.build(projectDir, BASE_CONFIG);
 
         assertTrue(index.testFqns().contains("com.example.FooTest"),
-                "Test FQN must surface from the rescan when a v=5 "
-                        + "future-schema snapshot exists. The schemaVersion "
-                        + "check at tryLoad must reject the v=5 snapshot — "
-                        + "downgrade across a CI matrix boundary cannot "
-                        + "feed future-shaped rows to a current-shaped "
-                        + "reader. Got: " + index.testFqns());
+                "Test FQN must surface from the rescan when a stale v=5 "
+                        + "snapshot exists. The schemaVersion check at "
+                        + "ProjectIndexCache.tryLoad must reject the v=5 "
+                        + "snapshot before the load path attempts to parse "
+                        + "rows whose decl column is wire-incompatible with "
+                        + "the v=6 QName disambiguator shape. Got: "
+                        + index.testFqns());
+    }
+
+    @Test
+    void headerEdgesKnobsContributeToConfigHash() {
+        // Issue #132: every new DSL knob must flow into
+        // {@link ProjectIndexCache#configHash} so an adopter
+        // flipping the knob across consecutive runs forces a clean
+        // rescan rather than reusing rows the new flag value would
+        // not produce. Without this, the cache would serve cold-side
+        // augmentation results for a warm side that produces a
+        // different augmentation set, which is the exact silent-
+        // stale-data class of bug the configHash check exists to
+        // catch.
+        AffectedTestsConfig.Builder base = AffectedTestsConfig.builder()
+                .mode(Mode.CI);
+
+        String hashBaseline = ProjectIndexCache.configHash(base.build());
+
+        // headerEdgesEnabled flip
+        String hashKillSwitch = ProjectIndexCache.configHash(
+                AffectedTestsConfig.builder().mode(Mode.CI)
+                        .headerEdgesEnabled(false).build());
+        assertNotEquals(hashBaseline, hashKillSwitch,
+                "headerEdgesEnabled flip must change the configHash — "
+                        + "warm cache must be invalidated when the kill switch flips");
+
+        // headerEdgesDepth change
+        String hashDepth = ProjectIndexCache.configHash(
+                AffectedTestsConfig.builder().mode(Mode.CI)
+                        .headerEdgesDepth(2).build());
+        assertNotEquals(hashBaseline, hashDepth,
+                "headerEdgesDepth must contribute to configHash — "
+                        + "different depth produces different augmentation sets");
+
+        // headerEdgesMaxSiblings change
+        String hashCap = ProjectIndexCache.configHash(
+                AffectedTestsConfig.builder().mode(Mode.CI)
+                        .headerEdgesMaxSiblings(99).build());
+        assertNotEquals(hashBaseline, hashCap,
+                "headerEdgesMaxSiblings must contribute to configHash — "
+                        + "different cap produces different suppression sets");
+
+        // headerEdgesExclude change
+        String hashExclude = ProjectIndexCache.configHash(
+                AffectedTestsConfig.builder().mode(Mode.CI)
+                        .headerEdgesExclude(Set.of(
+                                AffectedTestsConfig.HEADER_EDGE_ANNOTATIONS)).build());
+        assertNotEquals(hashBaseline, hashExclude,
+                "headerEdgesExclude must contribute to configHash — "
+                        + "different excluded categories produce different augmentation sets");
+
+        // headerEdgesIgnore change
+        String hashIgnore = ProjectIndexCache.configHash(
+                AffectedTestsConfig.builder().mode(Mode.CI)
+                        .headerEdgesIgnore(java.util.List.of("com.adopter.**")).build());
+        assertNotEquals(hashBaseline, hashIgnore,
+                "headerEdgesIgnore must contribute to configHash — "
+                        + "different ignore-glob list produces different "
+                        + "filtered edge sets");
+    }
+
+    @Test
+    void headerEdgesPersistAndReloadFromWarmCache() throws Exception {
+        // End-to-end round-trip: a cold build extracts HeaderEdges
+        // into {@link FileMetadata.TypeDecl}; a warm build must
+        // reload the same shape from the on-disk snapshot. Without
+        // this, the encode-side could silently truncate or the
+        // decode-side could fall back to {@link
+        // FileMetadata.HeaderEdges#EMPTY} on every reload — making
+        // the headerEdges strategy behave correctly on cold caches
+        // and wrong on every subsequent run, which is the worst
+        // possible failure shape (silent + intermittent).
+        writeJava(projectDir.resolve("src/main/java/com/example/Iface.java"),
+                "package com.example; public interface Iface {}");
+        writeJava(projectDir.resolve("src/main/java/com/example/Svc.java"),
+                "package com.example;\n"
+                        + "@SuppressWarnings(\"unused\")\n"
+                        + "public class Svc<T extends Iface> implements Iface {}");
+
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .mode(Mode.CI)
+                .build();
+
+        // Cold build — writes the snapshot.
+        ProjectIndex cold = ProjectIndex.build(projectDir, config);
+        Path svcPath = projectDir.resolve("src/main/java/com/example/Svc.java");
+        FileMetadata coldMd = cold.fileMetadata(svcPath);
+        assertNotNull(coldMd, "cold metadata must be present");
+        FileMetadata.TypeDecl coldSvc = coldMd.typeDeclarations().stream()
+                .filter(d -> d.simpleName().equals("Svc"))
+                .findFirst().orElseThrow();
+        assertEquals(java.util.List.of("Iface"),
+                coldSvc.headerEdges().implementsSimpleNames(),
+                "cold extraction must populate implements category");
+        assertEquals(java.util.List.of("Iface"),
+                coldSvc.headerEdges().typeBoundSimpleNames(),
+                "cold extraction must populate type-bound category");
+        assertEquals(java.util.List.of("SuppressWarnings"),
+                coldSvc.headerEdges().annotationSimpleNames(),
+                "cold extraction must populate annotations category");
+
+        // Warm build — must read the snapshot back. The configHash
+        // must match (no config change between runs) and the
+        // schemaVersion must match (no SCHEMA_VERSION bump in-flight).
+        ProjectIndex warm = ProjectIndex.build(projectDir, config);
+        FileMetadata warmMd = warm.fileMetadata(svcPath);
+        assertNotNull(warmMd, "warm metadata must be present");
+        FileMetadata.TypeDecl warmSvc = warmMd.typeDeclarations().stream()
+                .filter(d -> d.simpleName().equals("Svc"))
+                .findFirst().orElseThrow();
+        assertEquals(coldSvc.headerEdges().implementsSimpleNames(),
+                warmSvc.headerEdges().implementsSimpleNames(),
+                "warm reload must produce byte-identical implements category");
+        assertEquals(coldSvc.headerEdges().typeBoundSimpleNames(),
+                warmSvc.headerEdges().typeBoundSimpleNames(),
+                "warm reload must produce byte-identical type-bound category");
+        assertEquals(coldSvc.headerEdges().annotationSimpleNames(),
+                warmSvc.headerEdges().annotationSimpleNames(),
+                "warm reload must produce byte-identical annotations category");
+    }
+
+    @Test
+    void nestedDeclsWithSameSimpleNameKeepDistinctHeaderEdgesAcrossWarmCache() throws Exception {
+        // Issue #132 follow-up (correctness C1/ADV-HE-06): the
+        // pre-v6 cache keyed the per-file header-edges map on
+        // {@code TypeDecl.simpleName()}, so two nested decls sharing
+        // a simple name within one file collapsed onto a single map
+        // entry on reload. The strategy then saw "the same header
+        // edges on whichever nested decl happened to load last" and
+        // silently fabricated edges across the wrong outer's body.
+        // The v6 schema bump keyed on the qualified name; pin that
+        // the warm round-trip preserves both decls' edges distinctly.
+        writeJava(projectDir.resolve("src/main/java/com/example/Pair.java"),
+                "package com.example;\n"
+                        + "public class Pair {\n"
+                        + "    public static class A {\n"
+                        + "        public static class Z extends RuntimeException {}\n"
+                        + "    }\n"
+                        + "    public static class B {\n"
+                        + "        public static class Z implements java.io.Serializable {}\n"
+                        + "    }\n"
+                        + "}");
+
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .mode(Mode.CI)
+                .build();
+
+        ProjectIndex cold = ProjectIndex.build(projectDir, config);
+        Path pairPath = projectDir.resolve("src/main/java/com/example/Pair.java");
+        FileMetadata coldMd = cold.fileMetadata(pairPath);
+        assertNotNull(coldMd, "cold metadata must be present");
+        FileMetadata.TypeDecl coldAZ = coldMd.typeDeclarations().stream()
+                .filter(d -> d.qualifiedName().equals("Pair.A.Z"))
+                .findFirst().orElseThrow(() ->
+                        new AssertionError("Pair.A.Z must surface as a distinct TypeDecl. "
+                                + "Got " + coldMd.typeDeclarations().stream()
+                                .map(FileMetadata.TypeDecl::qualifiedName)
+                                .toList()));
+        FileMetadata.TypeDecl coldBZ = coldMd.typeDeclarations().stream()
+                .filter(d -> d.qualifiedName().equals("Pair.B.Z"))
+                .findFirst().orElseThrow(() ->
+                        new AssertionError("Pair.B.Z must surface as a distinct TypeDecl"));
+        assertEquals(java.util.List.of("RuntimeException"),
+                coldAZ.headerEdges().extendsSimpleNames(),
+                "cold A.Z extends RuntimeException");
+        assertEquals(java.util.List.of("java.io.Serializable"),
+                coldBZ.headerEdges().implementsSimpleNames(),
+                "cold B.Z implements Serializable");
+
+        // Warm reload — must keep the two Zs distinct.
+        ProjectIndex warm = ProjectIndex.build(projectDir, config);
+        FileMetadata warmMd = warm.fileMetadata(pairPath);
+        assertNotNull(warmMd, "warm metadata must be present");
+        FileMetadata.TypeDecl warmAZ = warmMd.typeDeclarations().stream()
+                .filter(d -> d.qualifiedName().equals("Pair.A.Z"))
+                .findFirst().orElseThrow();
+        FileMetadata.TypeDecl warmBZ = warmMd.typeDeclarations().stream()
+                .filter(d -> d.qualifiedName().equals("Pair.B.Z"))
+                .findFirst().orElseThrow();
+        assertEquals(coldAZ.headerEdges().extendsSimpleNames(),
+                warmAZ.headerEdges().extendsSimpleNames(),
+                "warm A.Z keeps its own extends — pre-v6 it was overwritten by B.Z's");
+        assertEquals(coldBZ.headerEdges().implementsSimpleNames(),
+                warmBZ.headerEdges().implementsSimpleNames(),
+                "warm B.Z keeps its own implements — pre-v6 it was overwritten by A.Z's");
+        assertEquals("Z", warmAZ.simpleName(),
+                "warm A.Z's simpleName is still the leaf — qualifiedName disambiguates");
+        assertEquals("Z", warmBZ.simpleName(),
+                "warm B.Z's simpleName is still the leaf — qualifiedName disambiguates");
     }
 
     @Test

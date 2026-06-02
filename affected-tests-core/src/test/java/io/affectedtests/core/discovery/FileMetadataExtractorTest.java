@@ -430,6 +430,167 @@ class FileMetadataExtractorTest {
     }
 
     @Test
+    void headerEdgesCaptureExtendsImplementsAndPermits() {
+        // Issue #132 — the six-category header-edges record is the
+        // first place {@code HeaderEdgesStrategy} touches. Pin the
+        // simple shapes (a plain class, a sealed interface, and a
+        // permitted impl) here so a parser-side regression that
+        // drops permits / mis-routes extends / implements is loud
+        // at this layer rather than appearing as a "headerEdges
+        // adds nothing" silent miss.
+        FileMetadata sealedSrc = extract("""
+                package com.example;
+                public sealed interface Shape extends Comparable<Shape>
+                        permits Circle, Square {}
+                """, "Shape");
+        FileMetadata.TypeDecl shape = sealedSrc.typeDeclarations().stream()
+                .filter(d -> d.simpleName().equals("Shape"))
+                .findFirst().orElseThrow();
+        FileMetadata.HeaderEdges sealedEdges = shape.headerEdges();
+        // {@code interface ... extends X} is the {@code extends}
+        // category — interfaces don't have an {@code implements}
+        // clause. The generic argument inside {@code Comparable<Shape>}
+        // is part of the extends clause's type, not a type-parameter
+        // bound — {@code Shape} itself declares no type parameters
+        // here, so {@code typeBoundSimpleNames} is empty.
+        assertEquals(List.of("Comparable"), sealedEdges.extendsSimpleNames());
+        assertTrue(sealedEdges.implementsSimpleNames().isEmpty());
+        assertEquals(List.of("Circle", "Square"), sealedEdges.permittedSimpleNames());
+        assertTrue(sealedEdges.typeBoundSimpleNames().isEmpty(),
+                "Shape declares no type parameters, so no type-bound edges");
+
+        FileMetadata classSrc = extract("""
+                package com.example;
+                public class FooService extends BaseService implements Service, AutoCloseable {}
+                """, "FooService");
+        FileMetadata.TypeDecl foo = classSrc.typeDeclarations().get(0);
+        FileMetadata.HeaderEdges fooEdges = foo.headerEdges();
+        assertEquals(List.of("BaseService"), fooEdges.extendsSimpleNames(),
+                "classes route to the extends category");
+        assertEquals(List.of("Service", "AutoCloseable"), fooEdges.implementsSimpleNames(),
+                "multi-implements must preserve order so --explain renders them deterministically");
+        assertTrue(fooEdges.permittedSimpleNames().isEmpty());
+    }
+
+    @Test
+    void headerEdgesCaptureGenericBoundsOnTypeParameters() {
+        // Type-parameter bounds are a header-edge category in their
+        // own right — a class declared as {@code <T extends Foo &
+        // Bar>} carries Foo and Bar as type-bound edges and the
+        // strategy must surface both. Intersection types (the {@code
+        // &} clause) are the place we previously dropped the
+        // secondary bound, so pin both.
+        FileMetadata md = extract("""
+                package com.example;
+                public class Box<T extends Number & Comparable<T>, U extends Iface> {}
+                """, "Box");
+        FileMetadata.TypeDecl box = md.typeDeclarations().get(0);
+        FileMetadata.HeaderEdges edges = box.headerEdges();
+        assertTrue(edges.typeBoundSimpleNames().contains("Number"));
+        assertTrue(edges.typeBoundSimpleNames().contains("Comparable"),
+                "the second bound after the & contributes its own type-bound entry");
+        assertTrue(edges.typeBoundSimpleNames().contains("Iface"));
+        // Generic arguments inside the bound (the {@code T} in
+        // {@code Comparable<T>}) are part of the bound's type, not
+        // a separate header-edge entry — the extractor takes the
+        // outer name only.
+        assertFalse(edges.typeBoundSimpleNames().contains("T"),
+                "type-parameter references inside the bound's generic args "
+                        + "must NOT be promoted to header-edge entries");
+    }
+
+    @Test
+    void headerEdgesCaptureRecordComponents() {
+        // Record components carry types in the header — a {@code
+        // record Money(long cents, Currency code)} contributes
+        // {@code Currency} as a record-component edge. {@code long}
+        // is a primitive and contributes no edge (HeaderEdgesStrategy
+        // can never resolve a primitive name to a project FQN).
+        FileMetadata md = extract("""
+                package com.example;
+                public record Money(long cents, Currency code, java.util.List<Note> notes)
+                        implements Comparable<Money> {}
+                """, "Money");
+        FileMetadata.TypeDecl money = md.typeDeclarations().get(0);
+        FileMetadata.HeaderEdges edges = money.headerEdges();
+        // {@code Currency} and {@code List} (component type) surface;
+        // {@code Note} is a nested generic and also surfaces; {@code
+        // long} does not. Primitive filtering is the extractor's job.
+        assertTrue(edges.recordComponentSimpleNames().contains("Currency"));
+        assertTrue(edges.recordComponentSimpleNames().contains("List")
+                        || edges.recordComponentSimpleNames().contains("Note"),
+                "the qualified component type's outer or inner simple name must surface");
+        assertFalse(edges.recordComponentSimpleNames().contains("long"),
+                "primitive types must NOT contribute record-component edges — "
+                        + "the strategy's FQN resolver could never match them");
+        // The {@code implements} clause still routes to the
+        // implements category, not record-components.
+        assertEquals(List.of("Comparable"), edges.implementsSimpleNames());
+    }
+
+    @Test
+    void headerEdgesCaptureClassLevelAnnotations() {
+        // Class-level annotations carry test-relevant behaviour in
+        // Spring-shaped codebases ({@code @Service}, {@code
+        // @Component}, {@code @Transactional}) and routing them
+        // through the strategy is one of issue #132's headline
+        // motivating cases. Field / method / parameter annotations
+        // are NOT class-level and must not leak into this list.
+        FileMetadata md = extract("""
+                package com.example;
+                import org.springframework.stereotype.Service;
+                @Service("fooBean")
+                @org.springframework.beans.factory.annotation.Autowired
+                public class FooImpl {
+                    @Deprecated
+                    private String field;
+                    @SuppressWarnings("unused")
+                    public void method(@Deprecated String s) {}
+                }
+                """, "FooImpl");
+        FileMetadata.TypeDecl foo = md.typeDeclarations().get(0);
+        FileMetadata.HeaderEdges edges = foo.headerEdges();
+        assertTrue(edges.annotationSimpleNames().contains("Service"),
+                "imported class-level annotation must surface as its simple name");
+        // Issue #132 follow-up (correctness C2/ADV-HE-01): a
+        // fully-qualified annotation name must be preserved verbatim,
+        // not stripped to its leaf. Stripping silently conflated
+        // {@code @org.springframework.Autowired} with a hypothetical
+        // shadowing project-local {@code com.example.Autowired},
+        // routing the strategy down a misresolved edge. The resolver's
+        // tier-0 routes the FQN directly to the ignore-glob layer so
+        // Spring's {@code org.springframework.**} default fires the
+        // ignored-by-glob outcome without involving any catalogue
+        // lookup.
+        assertTrue(edges.annotationSimpleNames().contains(
+                        "org.springframework.beans.factory.annotation.Autowired"),
+                "fully-qualified class-level annotation must surface verbatim "
+                        + "so ignore-globs can match the actual FQN");
+        assertFalse(edges.annotationSimpleNames().contains("Deprecated"),
+                "field-level annotations are NOT class-level and must not leak in");
+        assertFalse(edges.annotationSimpleNames().contains("SuppressWarnings"),
+                "method-level annotations are NOT class-level and must not leak in");
+    }
+
+    @Test
+    void headerEdgesAreEmptyForPlainClassWithNoHeader() {
+        // The all-empty sentinel ({@link FileMetadata.HeaderEdges#EMPTY})
+        // is the dominant case on the pre-issue-#132 code path: a
+        // top-level {@code class Foo {}} with no extends / implements
+        // / annotations / generics has nothing to contribute. Pin
+        // that the extractor produces that sentinel-shaped record
+        // rather than a six-empty-list construction the cache
+        // encoder would have to round-trip.
+        FileMetadata md = extract("""
+                package com.example;
+                public class Plain {}
+                """, "Plain");
+        FileMetadata.TypeDecl plain = md.typeDeclarations().get(0);
+        assertTrue(plain.headerEdges().isEmpty(),
+                "a plain class with no header-edge shape must surface HeaderEdges.EMPTY");
+    }
+
+    @Test
     void recordIsImmutableAndDefensivelyCopiesInputs() {
         // FileMetadata is shared across the discovery thread pool,
         // so mutation through any returned collection would race
@@ -468,5 +629,88 @@ class FileMetadataExtractorTest {
                 () -> md.typeRefSimpleNames().add("Evil"));
         assertThrows(UnsupportedOperationException.class,
                 () -> md.typeDeclarations().add(new FileMetadata.TypeDecl("Y", List.of())));
+    }
+
+    @Test
+    void qualifiedNameDisambiguatesNestedTypesSharingASimpleName() {
+        // Issue #132 follow-up (correctness C1/ADV-HE-06 + C4/ADV-HE-03)
+        // — when two outer classes each contain a nested type sharing
+        // the same simple name, both nested decls must carry distinct
+        // qualified names so the cache and the FQN catalogue can keep
+        // them apart. Previously both surfaced as {@code simpleName="Z"}
+        // and the cache's name-keyed merge collapsed their header
+        // edges onto a single entry, while the catalogue overwrote one
+        // FQN with the other.
+        FileMetadata md = extract("""
+                package com.example;
+                public class A {
+                    public static class Z {}
+                }
+                class B {
+                    public static class Z {}
+                }
+                """, "A");
+
+        List<String> qualified = new java.util.ArrayList<>();
+        for (FileMetadata.TypeDecl decl : md.typeDeclarations()) {
+            qualified.add(decl.qualifiedName());
+        }
+        assertTrue(qualified.contains("A"), "top-level A must surface as qualifiedName=A");
+        assertTrue(qualified.contains("B"), "top-level B must surface as qualifiedName=B");
+        assertTrue(qualified.contains("A.Z"),
+                "nested Z in A must surface as qualifiedName=A.Z, got " + qualified);
+        assertTrue(qualified.contains("B.Z"),
+                "nested Z in B must surface as qualifiedName=B.Z, got " + qualified);
+
+        for (FileMetadata.TypeDecl decl : md.typeDeclarations()) {
+            if (decl.qualifiedName().equals("A.Z") || decl.qualifiedName().equals("B.Z")) {
+                assertEquals("Z", decl.simpleName(),
+                        "nested type's simpleName must remain the leaf, "
+                                + "qualifiedName carries the in-CU path");
+            }
+        }
+    }
+
+    @Test
+    void qualifiedNameMatchesSimpleNameForTopLevelTypes() {
+        // The dominant case — top-level decls — must have
+        // qualifiedName == simpleName so every pre-#132 caller that
+        // reads simpleName keeps observing the expected leaf shape.
+        FileMetadata md = extract("""
+                package com.example;
+                public class Foo {}
+                class Bar {}
+                """, "Foo");
+        for (FileMetadata.TypeDecl decl : md.typeDeclarations()) {
+            assertEquals(decl.simpleName(), decl.qualifiedName(),
+                    "top-level decl's qualifiedName must equal its simpleName "
+                            + "to preserve pre-#132 behavior for the dominant case");
+        }
+    }
+
+    @Test
+    void fullyQualifiedAnnotationPreservesItsFqn() {
+        // Issue #132 follow-up (correctness C2/ADV-HE-01) — an
+        // annotation written as a fully-qualified usage like
+        // {@code @org.springframework.stereotype.Service} must
+        // surface verbatim, not stripped to {@code Service}.
+        // Stripping silently conflated the external Spring annotation
+        // with a hypothetical shadowing project-local {@code Service}.
+        FileMetadata md = extract("""
+                package com.example;
+                @org.springframework.stereotype.Service
+                public class FullyQualifiedBean {}
+                """, "FullyQualifiedBean");
+        FileMetadata.HeaderEdges edges = md.typeDeclarations().get(0).headerEdges();
+        assertTrue(edges.annotationSimpleNames()
+                        .contains("org.springframework.stereotype.Service"),
+                "FQ annotation usage must preserve its qualifier so the "
+                        + "ignore-glob layer can match the actual FQN, got "
+                        + edges.annotationSimpleNames());
+        assertFalse(edges.annotationSimpleNames().contains("Service"),
+                "FQ annotation must NOT also surface as the bare leaf — "
+                        + "duplicating it would route through both the "
+                        + "tier-0 FQN path and the tier-1-4 simple-name "
+                        + "resolver, doubling diagnostic edges");
     }
 }

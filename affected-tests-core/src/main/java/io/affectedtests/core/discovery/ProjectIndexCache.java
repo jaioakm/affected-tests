@@ -147,8 +147,37 @@ public final class ProjectIndexCache {
      * {@code configHash} to catch the rewire. The trade-off is
      * one CI cache-miss per adopter on the v=3→v=4 upgrade.
      * See {@code docs/PHASE-2-KOTLIN-AST.md} §7.
+     *
+     * <p>{@code v5} (issue&nbsp;#132, header-edges discovery strategy):
+     * the {@code m} per-file row gains a tenth field carrying the
+     * six header-edge categories for every
+     * {@link FileMetadata.TypeDecl} as a pipe-delimited list of
+     * {@code [decl@category:simple1,simple2;category:simple3]}
+     * groups. Older readers ignore the extra field via the
+     * {@code split(SEP, -1)} call already returning whatever
+     * tail-fields exist, but they cannot synthesise it on a warm
+     * run — bumping the version forces a clean rebuild rather than
+     * letting strategies consult {@link FileMetadata.HeaderEdges#EMPTY}
+     * for every cached row. Each {@code headerEdges*} DSL knob
+     * also participates in {@link #configHash} so a runtime opt-out
+     * still flips the cache to a miss, but the schema bump catches
+     * the binary-format upgrade boundary independently.
+     *
+     * <p>{@code v6} (issue&nbsp;#132 follow-up, nested-decl FQN fix):
+     * the {@code decls} field gains a third sub-element per entry
+     * carrying the in-CU qualified name
+     * ({@code simpleName=qualifiedName?supers}); the
+     * {@code headerEdges} field's per-decl key is now the
+     * qualified name rather than the simple name. Two nested
+     * decls sharing a simple name within one file
+     * ({@code class A { class Z {} } class B { class Z {} }}) used
+     * to collapse onto a single {@code Z} key when re-loading the
+     * cache, so warm runs silently fabricated header edges across
+     * the two outers. The schema bump forces a clean rebuild — the
+     * previously-encoded {@code Z} entries cannot be split
+     * post-hoc into the correct {@code A.Z} / {@code B.Z} keys.
      */
-    static final int SCHEMA_VERSION = 4;
+    static final int SCHEMA_VERSION = 6;
 
     private static final String CACHE_DIR_REL = "build/affected-tests/index/v1";
     private static final String SNAPSHOT_FILE = "snapshot.tsv";
@@ -187,6 +216,44 @@ public final class ProjectIndexCache {
      * declarations with no extends/implements clause.
      */
     private static final char SUPER_SEP = ',';
+
+    /**
+     * Issue&nbsp;#132 — inner separator between a category name
+     * and its simple-name list inside a single header-edges decl
+     * group: {@code extends:Foo,Bar;implements:Baz}. Reuses
+     * colon so a future grep against persisted snapshots can
+     * spot category labels without bespoke parsing knowledge.
+     */
+    private static final char HEADER_CAT_SEP = ':';
+
+    /**
+     * Issue&nbsp;#132 — inner separator between consecutive
+     * category groups in a single header-edges decl: {@code
+     * extends:Foo;implements:Bar;annotations:Component}.
+     */
+    private static final char HEADER_GROUP_SEP = ';';
+
+    /**
+     * Issue&nbsp;#132 — inner separator between a decl's simple
+     * name and its header-edges category list in the per-file
+     * row's new tenth field: {@code Decl1@extends:Foo;implements:Bar|Decl2@...}.
+     */
+    private static final char HEADER_DECL_SEP = '@';
+
+    /**
+     * Issue&nbsp;#132 (schema v6) — separates a decl's simple name from
+     * its in-CU qualified name in the {@code decls} field. Two nested
+     * types with the same simple name within one file used to collapse
+     * onto a single cache key on reload (correctness finding C1).
+     * Wire form per entry: {@code simpleName[~qualifiedName]=super1,super2}.
+     * The {@code ~qualifiedName} suffix is omitted when the qualified
+     * name equals the simple name (the dominant top-level case), so
+     * snapshots produced by projects with no nested types stay
+     * byte-identical to the v5 shape. {@code ~} is not a legal Java
+     * identifier character (JLS §3.8) so it cannot collide with any
+     * decl name we encode.
+     */
+    private static final char QNAME_SEP = '~';
 
     private ProjectIndexCache() {}
 
@@ -545,6 +612,23 @@ public final class ProjectIndexCache {
         // dropped the {@code -Daffected-tests.kotlin.enabled} system
         // property, but the DSL flag still flips the cache shape.)
         sb.append("|kotlinEnabled:").append(config.kotlinEnabled());
+        // Issue #132 — header-edges DSL knobs participate so any
+        // runtime change to the strategy's behaviour (kill switch,
+        // category opt-out, depth, sibling cap, ignore globs) forces
+        // a clean cache rebuild. The schema bump (v=4 → v=5) catches
+        // the binary-format change introduced for the {@code m} row's
+        // new tenth field; this hash catches the same-binary,
+        // different-config case (an adopter flipping
+        // {@code headerEdgesEnabled} between runs).
+        sb.append("|headerEdgesEnabled:").append(config.headerEdgesEnabled());
+        sb.append("|headerEdgesDepth:").append(config.headerEdgesDepth());
+        sb.append("|headerEdgesMaxSiblings:").append(config.headerEdgesMaxSiblings());
+        sb.append("|headerEdgesExclude:");
+        List<String> excludeSorted = new ArrayList<>(config.headerEdgesExclude());
+        Collections.sort(excludeSorted);
+        sb.append(excludeSorted);
+        sb.append("|headerEdgesIgnore:");
+        appendList(sb, config.headerEdgesIgnore());
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] digest = md.digest(sb.toString().getBytes(StandardCharsets.UTF_8));
@@ -793,16 +877,19 @@ public final class ProjectIndexCache {
      *
      * <p>Wire shape (single line, tab-separated outer fields):
      * <pre>
-     *   m\t&lt;absPath&gt;\t&lt;mtime&gt;\t&lt;size&gt;\t&lt;package&gt;\t&lt;primaryType?&gt;\t&lt;imports&gt;\t&lt;refSimples&gt;\t&lt;refDotted&gt;\t&lt;decls&gt;
+     *   m\t&lt;absPath&gt;\t&lt;mtime&gt;\t&lt;size&gt;\t&lt;package&gt;\t&lt;primaryType?&gt;\t&lt;imports&gt;\t&lt;refSimples&gt;\t&lt;refDotted&gt;\t&lt;decls&gt;\t&lt;headerEdges&gt;
      * </pre>
      *
      * <p>Inner list separators avoid any character that can legally
      * appear inside a Java identifier or qualified name:
      * <ul>
-     *   <li>{@code |} between list entries</li>
-     *   <li>{@code :} between an import name and its kind flag (n / s / w / sw)</li>
+     *   <li>{@code |} between list entries (and between {@code headerEdges} per-decl groups)</li>
+     *   <li>{@code :} between an import name and its kind flag (n / s / w / sw),
+     *       and between a {@code headerEdges} category label and its names</li>
      *   <li>{@code =} between a declaration's simple name and its supertype list</li>
      *   <li>{@code ,} between supertype names within a single declaration</li>
+     *   <li>{@code @} between a {@code headerEdges} decl name and its category groups</li>
+     *   <li>{@code ;} between {@code headerEdges} category groups within one decl</li>
      * </ul>
      * <p>Empty list fields write as the empty string between two tabs;
      * the reader produces {@link Set#of()} / {@link List#of()} for those.
@@ -821,6 +908,7 @@ public final class ProjectIndexCache {
             sb.append(SEP).append(joinList(md.typeRefSimpleNames()));
             sb.append(SEP).append(joinList(md.typeRefDottedNames()));
             sb.append(SEP).append(encodeDecls(md.typeDeclarations()));
+            sb.append(SEP).append(encodeHeaderEdges(md.typeDeclarations()));
             return sb.toString();
         }
 
@@ -847,6 +935,17 @@ public final class ProjectIndexCache {
                 Set<String> refSimples = decodeSet(parts[6]);
                 Set<String> refDotted = decodeSet(parts[7]);
                 List<FileMetadata.TypeDecl> decls = decodeDecls(parts[8]);
+                // Issue #132 — tenth field carries the per-decl
+                // {@link FileMetadata.HeaderEdges}. Older snapshots
+                // (v=4) lack the field; the schema-version check at
+                // {@link Snapshot#read} short-circuits before any
+                // m-row reaches here, but the defensive shape still
+                // tolerates a missing tenth field by leaving every
+                // decl's headerEdges at its EMPTY default — keeping
+                // the parser usable on hand-edited snapshots.
+                if (parts.length >= 10 && !parts[9].isEmpty()) {
+                    decls = mergeHeaderEdges(decls, decodeHeaderEdges(parts[9]));
+                }
                 FileMetadata md = new FileMetadata(pkg, primary, imports, refSimples, refDotted, decls);
                 return new FileMetadataRow(path, mtime, size, md);
             } catch (RuntimeException e) {
@@ -914,7 +1013,15 @@ public final class ProjectIndexCache {
             for (int i = 0; i < decls.size(); i++) {
                 if (i > 0) sb.append(LIST_SEP);
                 FileMetadata.TypeDecl d = decls.get(i);
-                sb.append(d.simpleName()).append(DECL_SEP);
+                sb.append(d.simpleName());
+                // Issue #132 (schema v6) — emit the qualified-name
+                // disambiguator only when it differs from the simple
+                // name, keeping the wire compact for the dominant
+                // top-level-only case.
+                if (!d.qualifiedName().equals(d.simpleName())) {
+                    sb.append(QNAME_SEP).append(d.qualifiedName());
+                }
+                sb.append(DECL_SEP);
                 List<String> sup = d.supertypeSimpleNames();
                 for (int j = 0; j < sup.size(); j++) {
                     if (j > 0) sb.append(SUPER_SEP);
@@ -930,8 +1037,18 @@ public final class ProjectIndexCache {
             for (String entry : raw.split("\\" + LIST_SEP, -1)) {
                 int eq = entry.indexOf(DECL_SEP);
                 if (eq < 0) continue;
-                String simple = entry.substring(0, eq);
+                String head = entry.substring(0, eq);
                 String supRaw = entry.substring(eq + 1);
+                String simple;
+                String qualified;
+                int tilde = head.indexOf(QNAME_SEP);
+                if (tilde < 0) {
+                    simple = head;
+                    qualified = head;
+                } else {
+                    simple = head.substring(0, tilde);
+                    qualified = head.substring(tilde + 1);
+                }
                 List<String> sup;
                 if (supRaw.isEmpty()) {
                     sup = List.of();
@@ -941,7 +1058,147 @@ public final class ProjectIndexCache {
                         if (!s.isEmpty()) sup.add(s);
                     }
                 }
-                out.add(new FileMetadata.TypeDecl(simple, sup));
+                out.add(new FileMetadata.TypeDecl(
+                        simple, qualified, sup, FileMetadata.HeaderEdges.EMPTY));
+            }
+            return out;
+        }
+
+        /**
+         * Issue&nbsp;#132 — encodes the per-decl
+         * {@link FileMetadata.HeaderEdges} as a pipe-delimited list
+         * of groups, one per decl that has non-empty header edges:
+         * {@code Decl1@extends:Foo;implements:Bar|Decl2@type-bounds:T}.
+         * Decls without header edges are omitted entirely (the
+         * {@link FileMetadata.HeaderEdges#EMPTY} sentinel covers
+         * them on decode). The empty string is the legal "no decl
+         * has header edges" encoding.
+         */
+        private static String encodeHeaderEdges(List<FileMetadata.TypeDecl> decls) {
+            if (decls.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (FileMetadata.TypeDecl d : decls) {
+                FileMetadata.HeaderEdges he = d.headerEdges();
+                if (he == null || he.isEmpty()) continue;
+                if (!first) sb.append(LIST_SEP);
+                first = false;
+                // Issue #132 (schema v6) — key on the in-CU qualified
+                // name so nested decls with the same simple name don't
+                // collide on cache decode (correctness finding C1).
+                sb.append(d.qualifiedName()).append(HEADER_DECL_SEP);
+                boolean firstGroup = true;
+                firstGroup = appendCategory(sb, firstGroup,
+                        AffectedTestsConfig.HEADER_EDGE_EXTENDS, he.extendsSimpleNames());
+                firstGroup = appendCategory(sb, firstGroup,
+                        AffectedTestsConfig.HEADER_EDGE_IMPLEMENTS, he.implementsSimpleNames());
+                firstGroup = appendCategory(sb, firstGroup,
+                        AffectedTestsConfig.HEADER_EDGE_PERMITS, he.permittedSimpleNames());
+                firstGroup = appendCategory(sb, firstGroup,
+                        AffectedTestsConfig.HEADER_EDGE_TYPE_BOUNDS, he.typeBoundSimpleNames());
+                firstGroup = appendCategory(sb, firstGroup,
+                        AffectedTestsConfig.HEADER_EDGE_RECORD_COMPONENTS,
+                        he.recordComponentSimpleNames());
+                appendCategory(sb, firstGroup,
+                        AffectedTestsConfig.HEADER_EDGE_ANNOTATIONS, he.annotationSimpleNames());
+            }
+            return sb.toString();
+        }
+
+        private static boolean appendCategory(StringBuilder sb, boolean first,
+                                              String category, List<String> names) {
+            if (names.isEmpty()) return first;
+            if (!first) sb.append(HEADER_GROUP_SEP);
+            sb.append(category).append(HEADER_CAT_SEP);
+            for (int i = 0; i < names.size(); i++) {
+                if (i > 0) sb.append(SUPER_SEP);
+                sb.append(names.get(i));
+            }
+            return false;
+        }
+
+        /**
+         * Issue&nbsp;#132 (schema v6) — decodes the
+         * {@link #encodeHeaderEdges} payload into a map of
+         * {@code declQualifiedName -> HeaderEdges}. The map key is the
+         * in-CU qualified name (e.g. {@code "Outer.Inner"} for nested
+         * decls) so {@link #mergeHeaderEdges} can disambiguate two
+         * nested decls with the same simple name (correctness finding
+         * C1). Garbled groups are skipped (a single bad group inside an
+         * otherwise-fine row shouldn't lose the whole row's header
+         * edges); a malformed top-level segment is silently dropped via
+         * the same {@code indexOf == -1} branch the supertype decoder
+         * uses on the line above.
+         */
+        private static Map<String, FileMetadata.HeaderEdges> decodeHeaderEdges(String raw) {
+            Map<String, FileMetadata.HeaderEdges> out = new LinkedHashMap<>();
+            for (String entry : raw.split("\\" + LIST_SEP, -1)) {
+                if (entry.isEmpty()) continue;
+                int at = entry.indexOf(HEADER_DECL_SEP);
+                if (at < 0) continue;
+                String qualified = entry.substring(0, at);
+                String groups = entry.substring(at + 1);
+                List<String> extendsN = new ArrayList<>();
+                List<String> implementsN = new ArrayList<>();
+                List<String> permitsN = new ArrayList<>();
+                List<String> boundsN = new ArrayList<>();
+                List<String> componentsN = new ArrayList<>();
+                List<String> annotationsN = new ArrayList<>();
+                for (String group : groups.split(String.valueOf(HEADER_GROUP_SEP), -1)) {
+                    int colon = group.indexOf(HEADER_CAT_SEP);
+                    if (colon < 0) continue;
+                    String category = group.substring(0, colon);
+                    String namesRaw = group.substring(colon + 1);
+                    List<String> sink = switch (category) {
+                        case AffectedTestsConfig.HEADER_EDGE_EXTENDS -> extendsN;
+                        case AffectedTestsConfig.HEADER_EDGE_IMPLEMENTS -> implementsN;
+                        case AffectedTestsConfig.HEADER_EDGE_PERMITS -> permitsN;
+                        case AffectedTestsConfig.HEADER_EDGE_TYPE_BOUNDS -> boundsN;
+                        case AffectedTestsConfig.HEADER_EDGE_RECORD_COMPONENTS -> componentsN;
+                        case AffectedTestsConfig.HEADER_EDGE_ANNOTATIONS -> annotationsN;
+                        default -> null;
+                    };
+                    if (sink == null) continue;
+                    for (String n : namesRaw.split(String.valueOf(SUPER_SEP), -1)) {
+                        if (!n.isEmpty()) sink.add(n);
+                    }
+                }
+                out.put(qualified, new FileMetadata.HeaderEdges(
+                        extendsN, implementsN, permitsN,
+                        boundsN, componentsN, annotationsN));
+            }
+            return out;
+        }
+
+        /**
+         * Issue&nbsp;#132 (schema v6) — merges the post-pass header-edges
+         * map back into the decl list produced by {@link #decodeDecls}.
+         * Keyed on {@link FileMetadata.TypeDecl#qualifiedName()} so two
+         * nested decls sharing a simple name (e.g.
+         * {@code class A { class Z {} } class B { class Z {} }}) keep
+         * their own header edges instead of collapsing onto a single
+         * {@code Z} cache entry (correctness finding C1/ADV-HE-06).
+         *
+         * <p>Decls that don't appear in {@code byQualifiedName} keep
+         * their default {@link FileMetadata.HeaderEdges#EMPTY}; decls
+         * that do appear get a fresh {@link FileMetadata.TypeDecl}
+         * carrying the loaded header edges. The original supertype list
+         * and qualified name are preserved verbatim.
+         */
+        private static List<FileMetadata.TypeDecl> mergeHeaderEdges(
+                List<FileMetadata.TypeDecl> decls,
+                Map<String, FileMetadata.HeaderEdges> byQualifiedName) {
+            if (byQualifiedName.isEmpty()) return decls;
+            List<FileMetadata.TypeDecl> out = new ArrayList<>(decls.size());
+            for (FileMetadata.TypeDecl d : decls) {
+                FileMetadata.HeaderEdges he = byQualifiedName.get(d.qualifiedName());
+                if (he == null) {
+                    out.add(d);
+                } else {
+                    out.add(new FileMetadata.TypeDecl(
+                            d.simpleName(), d.qualifiedName(),
+                            d.supertypeSimpleNames(), he));
+                }
             }
             return out;
         }

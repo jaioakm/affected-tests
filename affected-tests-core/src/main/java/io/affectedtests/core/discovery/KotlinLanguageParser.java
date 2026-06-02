@@ -14,15 +14,21 @@ import org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil;
 import org.jetbrains.kotlin.config.CommonConfigurationKeys;
 import org.jetbrains.kotlin.config.CompilerConfiguration;
 import org.jetbrains.kotlin.psi.KtAnnotationEntry;
+import org.jetbrains.kotlin.psi.KtClass;
 import org.jetbrains.kotlin.psi.KtClassOrObject;
 import org.jetbrains.kotlin.psi.KtDeclaration;
 import org.jetbrains.kotlin.psi.KtFile;
 import org.jetbrains.kotlin.psi.KtImportDirective;
 import org.jetbrains.kotlin.psi.KtNullableType;
 import org.jetbrains.kotlin.psi.KtObjectDeclaration;
+import org.jetbrains.kotlin.psi.KtParameter;
+import org.jetbrains.kotlin.psi.KtPrimaryConstructor;
 import org.jetbrains.kotlin.psi.KtPsiFactory;
+import org.jetbrains.kotlin.psi.KtSuperTypeCallEntry;
 import org.jetbrains.kotlin.psi.KtSuperTypeListEntry;
+import org.jetbrains.kotlin.psi.KtTypeConstraint;
 import org.jetbrains.kotlin.psi.KtTypeElement;
+import org.jetbrains.kotlin.psi.KtTypeParameter;
 import org.jetbrains.kotlin.psi.KtTypeReference;
 import org.jetbrains.kotlin.psi.KtUserType;
 import org.slf4j.Logger;
@@ -718,12 +724,13 @@ final class KotlinLanguageParser implements LanguageParser {
     private static List<FileMetadata.TypeDecl> collectTypeDecls(KtFile ktFile) {
         List<FileMetadata.TypeDecl> out = new ArrayList<>();
         for (KtDeclaration decl : ktFile.getDeclarations()) {
-            collectTypeDeclsRecursive(decl, out);
+            collectTypeDeclsRecursive(decl, "", out);
         }
         return out;
     }
 
     private static void collectTypeDeclsRecursive(KtDeclaration decl,
+                                                  String scopePrefix,
                                                   List<FileMetadata.TypeDecl> out) {
         if (!(decl instanceof KtClassOrObject classOrObject)) return;
         if (isGenericCompanion(classOrObject)) {
@@ -742,7 +749,11 @@ final class KotlinLanguageParser implements LanguageParser {
             // surfaces. Custom-named companions ({@code companion
             // object Foo}) flow through normally — {@code Foo} is
             // specific enough to participate.
-            walkChildDeclarations(classOrObject, out);
+            // Issue #132 — companion's body recurses under the
+            // outer scope unchanged; the companion itself doesn't
+            // contribute a TypeDecl so the scope prefix doesn't
+            // need to advance through {@code Companion}.
+            walkChildDeclarations(classOrObject, scopePrefix, out);
             return;
         }
         String simpleName = classOrObject.getName();
@@ -755,12 +766,176 @@ final class KotlinLanguageParser implements LanguageParser {
             // but Implementation's match tier on
             // {@code supertypeSimpleNames.contains(...)} would
             // never resolve such a self-referential entry).
-            walkChildDeclarations(classOrObject, out);
+            walkChildDeclarations(classOrObject, scopePrefix, out);
             return;
         }
         List<String> superNames = collectSupertypeSimpleNames(classOrObject);
-        out.add(new FileMetadata.TypeDecl(simpleName, superNames));
-        walkChildDeclarations(classOrObject, out);
+        FileMetadata.HeaderEdges headerEdges = collectHeaderEdges(classOrObject, superNames);
+        // Issue #132 — qualifiedName is the in-CU path so nested decls
+        // sharing a simple name across siblings don't collide on cache
+        // decode (correctness finding C1) or in the FQN catalogue
+        // (correctness finding C4). Top-level decls keep
+        // qualifiedName == simpleName.
+        String qualifiedName = scopePrefix.isEmpty() ? simpleName : scopePrefix + "." + simpleName;
+        out.add(new FileMetadata.TypeDecl(simpleName, qualifiedName, superNames, headerEdges));
+        walkChildDeclarations(classOrObject, qualifiedName, out);
+    }
+
+    /**
+     * Issue&nbsp;#132 — extracts the six header-edge categories for a
+     * Kotlin {@link KtClassOrObject}.
+     *
+     * <p>Mapping notes (Kotlin's syntactic surface differs from
+     * Java's, so the categorisation is best-effort):
+     * <ul>
+     *   <li><strong>extends vs implements (categories 1 + 2)</strong>:
+     *       Kotlin uses a single colon-prefixed
+     *       {@code super-type list}; the first entry that uses
+     *       constructor-call syntax ({@code : Base()}) is the class
+     *       supertype and surfaces as {@code extends}, every other
+     *       entry is an interface and surfaces as
+     *       {@code implements}. For interfaces (no constructor call
+     *       on any entry) all entries surface as {@code extends}
+     *       (interfaces in Kotlin extend, they don't implement).
+     *       Kotlin {@code object}s follow the same rule as classes.
+     *       This mirrors how the JVM compiles the same declarations,
+     *       so a {@code class StripeGateway : PaymentGateway} —
+     *       Kotlin's syntactic shape for the killer Spring DI case —
+     *       reliably surfaces in {@code implementsSimpleNames}.</li>
+     *   <li><strong>permits (category 3)</strong>: Kotlin
+     *       {@code sealed} types don't carry a permits list — sealed
+     *       hierarchies are restricted to the same file (or
+     *       compilation module on 1.7+). Always empty.</li>
+     *   <li><strong>type bounds (category 4)</strong>: Walks both
+     *       inline bounds ({@code <T : Foo>}) and the
+     *       {@code where T : Foo, T : Bar} constraint clause.</li>
+     *   <li><strong>record components (category 5)</strong>:
+     *       Surfaces primary-constructor parameter types for
+     *       {@code data class}es, matching how Java {@code record}s
+     *       expose their component types as header edges. Plain
+     *       classes also surface their primary-constructor types —
+     *       Kotlin's primary constructor IS the type's identity in
+     *       the same way a record's component list is.</li>
+     *   <li><strong>annotations (category 6)</strong>: Class-level
+     *       annotations from
+     *       {@link KtClassOrObject#getAnnotationEntries()}.</li>
+     * </ul>
+     *
+     * <p>The {@code superNames} list is the already-flattened
+     * combined supertype list (categories 1 + 2 union) — passed in
+     * so we can re-categorise without re-walking the PSI tree. The
+     * categorisation here is the only place that needs the
+     * extends-vs-implements distinction; consumers that don't care
+     * (like the pre-headerEdges {@link ImplementationStrategy}'s
+     * fixpoint walk) keep reading {@code supertypeSimpleNames} as
+     * the union.
+     */
+    private static FileMetadata.HeaderEdges collectHeaderEdges(KtClassOrObject decl,
+                                                               List<String> superNames) {
+        List<KtSuperTypeListEntry> entries = decl.getSuperTypeListEntries();
+        List<String> extendsNames = new ArrayList<>();
+        List<String> implementsNames = new ArrayList<>();
+        boolean isInterface = decl instanceof KtClass kt && kt.isInterface();
+        if (entries != null) {
+            for (KtSuperTypeListEntry entry : entries) {
+                String name = supertypeEntrySimpleName(entry);
+                if (name == null) continue;
+                if (isInterface) {
+                    // Kotlin interfaces extend, never implement. JVM
+                    // compiles them with {@code extends} edges; we
+                    // mirror that so a base interface change reaches
+                    // tests of its sub-interface consumers.
+                    extendsNames.add(name);
+                } else if (entry instanceof KtSuperTypeCallEntry) {
+                    // Constructor-call form ({@code : Base()}) means
+                    // "this is the class supertype". Kotlin allows
+                    // at most one such entry per class.
+                    extendsNames.add(name);
+                } else {
+                    // Any non-call entry on a class declaration is an
+                    // interface (Kotlin syntax forbids extending two
+                    // classes). This is the Spring DI killer case
+                    // shape ({@code class StripeGateway : PaymentGateway}).
+                    implementsNames.add(name);
+                }
+            }
+        }
+
+        List<String> typeBoundNames = new ArrayList<>();
+        if (decl instanceof KtClass ktClass) {
+            for (KtTypeParameter param : ktClass.getTypeParameters()) {
+                KtTypeReference extendsBound = param.getExtendsBound();
+                appendSimpleName(extendsBound, typeBoundNames);
+            }
+            for (KtTypeConstraint constraint : ktClass.getTypeConstraints()) {
+                appendSimpleName(constraint.getBoundTypeReference(), typeBoundNames);
+            }
+        }
+
+        List<String> recordComponentNames = new ArrayList<>();
+        KtPrimaryConstructor primary = decl.getPrimaryConstructor();
+        if (primary != null) {
+            for (KtParameter param : primary.getValueParameters()) {
+                appendSimpleName(param.getTypeReference(), recordComponentNames);
+            }
+        }
+
+        List<String> annotationNames = new ArrayList<>();
+        for (KtAnnotationEntry ann : decl.getAnnotationEntries()) {
+            org.jetbrains.kotlin.name.Name shortName = ann.getShortName();
+            if (shortName != null) {
+                annotationNames.add(shortName.asString());
+            }
+        }
+
+        if (extendsNames.isEmpty() && implementsNames.isEmpty()
+                && typeBoundNames.isEmpty() && recordComponentNames.isEmpty()
+                && annotationNames.isEmpty()) {
+            return FileMetadata.HeaderEdges.EMPTY;
+        }
+        return new FileMetadata.HeaderEdges(
+                extendsNames, implementsNames, List.of(),
+                typeBoundNames, recordComponentNames, annotationNames);
+    }
+
+    private static String supertypeEntrySimpleName(KtSuperTypeListEntry entry) {
+        KtTypeReference ref = entry.getTypeReference();
+        if (ref == null) return null;
+        KtTypeElement element = ref.getTypeElement();
+        while (element instanceof KtNullableType nullable) {
+            element = nullable.getInnerType();
+        }
+        if (!(element instanceof KtUserType userType)) return null;
+        String name = userType.getReferencedName();
+        return (name == null || name.isEmpty()) ? null : name;
+    }
+
+    /**
+     * Appends the simple name of {@code typeRef}'s outer type plus
+     * any inner type-argument simple names. Mirrors how the Java
+     * extractor surfaces {@code List<Customer>} as both {@code List}
+     * and {@code Customer} when surfaced as a record-component
+     * type — the strategy resolves either side back to its FQN.
+     */
+    private static void appendSimpleName(KtTypeReference typeRef, List<String> sink) {
+        if (typeRef == null) return;
+        KtTypeElement element = typeRef.getTypeElement();
+        while (element instanceof KtNullableType nullable) {
+            element = nullable.getInnerType();
+        }
+        if (!(element instanceof KtUserType userType)) return;
+        String outer = userType.getReferencedName();
+        if (outer != null && !outer.isEmpty()) {
+            sink.add(outer);
+        }
+        // Generic-argument types ({@code val x: List<Customer>}
+        // surfaces {@code Customer} too) are emitted as their own
+        // {@link KtTypeReference} children inside the user type's
+        // argument list — recurse so multi-arg generics surface
+        // every inner type.
+        for (KtTypeReference innerRef : userType.getTypeArgumentsAsTypes()) {
+            appendSimpleName(innerRef, sink);
+        }
     }
 
     /**
@@ -793,9 +968,10 @@ final class KotlinLanguageParser implements LanguageParser {
     }
 
     private static void walkChildDeclarations(KtClassOrObject classOrObject,
+                                              String scopePrefix,
                                               List<FileMetadata.TypeDecl> out) {
         for (KtDeclaration child : classOrObject.getDeclarations()) {
-            collectTypeDeclsRecursive(child, out);
+            collectTypeDeclsRecursive(child, scopePrefix, out);
         }
     }
 

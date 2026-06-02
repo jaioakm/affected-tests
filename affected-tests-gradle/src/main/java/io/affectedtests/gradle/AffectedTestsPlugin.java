@@ -63,7 +63,18 @@ public class AffectedTestsPlugin implements Plugin<Project> {
         // never silently expands the diff boundary.
         extension.getIncludeUncommitted().convention(false);
         extension.getIncludeStaged().convention(false);
-        extension.getStrategies().convention(List.of("naming", "usage", "impl", "transitive"));
+        // Issue #132 ships {@code headerEdges} as a default-on
+        // strategy. The DSL knob {@code headerEdgesEnabled = false}
+        // is the documented one-flag kill switch; removing
+        // {@code "headerEdges"} from the strategies list here is the
+        // secondary opt-out for adopters who curate the strategies
+        // set explicitly (mirrors how transitive can be dropped the
+        // same way). The core-side
+        // {@link io.affectedtests.core.config.AffectedTestsConfig.Builder#strategies}
+        // default already includes headerEdges; this convention only
+        // surfaces the same list to adopters who never override it.
+        extension.getStrategies().convention(
+                List.of("naming", "usage", "impl", "transitive", "headerEdges"));
         extension.getTransitiveDepth().convention(4);
         extension.getTestSuffixes().convention(List.of("Test", "IT", "ITTest", "IntegrationTest"));
         extension.getSourceDirs().convention(List.of("src/main/java"));
@@ -111,6 +122,21 @@ public class AffectedTestsPlugin implements Plugin<Project> {
         // regression. Default ON.
         extension.getKotlinEnabled().convention(true);
 
+        // Issue #132 — header-edges discovery strategy defaults.
+        // Default ON, no per-category opt-out, depth 1, sibling cap
+        // 5. The ignore-glob list is intentionally NOT given a
+        // convention here: when the Gradle Property is unset, the
+        // core {@link io.affectedtests.core.config.AffectedTestsConfig.Builder#headerEdgesIgnore}
+        // default fires, which keeps the canonical "framework noise
+        // muted" list in one place. Setting the convention to a
+        // copy would silently fork the two lists; the Property's
+        // {@code orElse}-on-the-task-side relies on this absence to
+        // distinguish "adopter explicitly emptied the list" from
+        // "adopter didn't touch the knob".
+        extension.getHeaderEdgesEnabled().convention(true);
+        extension.getHeaderEdgesDepth().convention(1);
+        extension.getHeaderEdgesMaxSiblings().convention(5);
+
         Project rootProject = project.getRootProject();
         Directory rootDir = rootProject.getLayout().getProjectDirectory();
 
@@ -134,6 +160,11 @@ public class AffectedTestsPlugin implements Plugin<Project> {
             task.getImplementationNaming().set(extension.getImplementationNaming());
             task.getParallelDiscovery().set(extension.getParallelDiscovery());
             task.getKotlinEnabled().set(extension.getKotlinEnabled());
+            task.getHeaderEdgesEnabled().set(extension.getHeaderEdgesEnabled());
+            task.getHeaderEdgesExclude().set(extension.getHeaderEdgesExclude());
+            task.getHeaderEdgesDepth().set(extension.getHeaderEdgesDepth());
+            task.getHeaderEdgesMaxSiblings().set(extension.getHeaderEdgesMaxSiblings());
+            task.getHeaderEdgesIgnore().set(extension.getHeaderEdgesIgnore());
             task.getMode().set(extension.getMode());
             task.getOnEmptyDiff().set(extension.getOnEmptyDiff());
             task.getOnAllFilesIgnored().set(extension.getOnAllFilesIgnored());

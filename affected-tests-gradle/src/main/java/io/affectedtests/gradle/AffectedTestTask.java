@@ -174,6 +174,70 @@ public abstract class AffectedTestTask extends DefaultTask {
     public abstract Property<Boolean> getKotlinEnabled();
 
     /**
+     * Issue&nbsp;#132 — kill switch for the {@code headerEdges}
+     * discovery strategy. See
+     * {@link AffectedTestsExtension#getHeaderEdgesEnabled()} for
+     * the full rationale. {@code @Input} so a flip across runs
+     * forces fresh discovery — the strategy's contribution can
+     * widen the selected set materially.
+     *
+     * @return the headerEdges-enabled property
+     */
+    @Input
+    public abstract Property<Boolean> getHeaderEdgesEnabled();
+
+    /**
+     * Issue&nbsp;#132 — header-edge categories the adopter has
+     * opted OUT of. See
+     * {@link AffectedTestsExtension#getHeaderEdgesExclude()} for
+     * the valid category names and rationale. Unset (or empty)
+     * means "all categories on".
+     *
+     * @return the headerEdgesExclude list property
+     */
+    @Input
+    @org.gradle.api.tasks.Optional
+    public abstract ListProperty<String> getHeaderEdgesExclude();
+
+    /**
+     * Issue&nbsp;#132 — header-edge walk depth ({@code 1}, the
+     * default, walks immediate header targets only). See
+     * {@link AffectedTestsExtension#getHeaderEdgesDepth()} for the
+     * clamping and "explosion at depth>2" rationale.
+     *
+     * @return the headerEdges depth property
+     */
+    @Input
+    public abstract Property<Integer> getHeaderEdgesDepth();
+
+    /**
+     * Issue&nbsp;#132 — sibling cap on the downward impl-walk
+     * triggered by a header-edge-added type. See
+     * {@link AffectedTestsExtension#getHeaderEdgesMaxSiblings()}
+     * for the {@code BaseController} explosion case the cap
+     * exists to neutralise. {@code 5} by default.
+     *
+     * @return the headerEdgesMaxSiblings property
+     */
+    @Input
+    public abstract Property<Integer> getHeaderEdgesMaxSiblings();
+
+    /**
+     * Issue&nbsp;#132 — globs (FQN patterns) for types whose
+     * header-edge contributions are ignored. Optional — when
+     * unset the core config builder's default list applies, which
+     * mutes JDK / Spring / JUnit / Mockito / Kotlin / Lombok
+     * stdlib noise. See
+     * {@link AffectedTestsExtension#getHeaderEdgesIgnore()} for
+     * extension vs replace semantics.
+     *
+     * @return the headerEdgesIgnore list property
+     */
+    @Input
+    @org.gradle.api.tasks.Optional
+    public abstract ListProperty<String> getHeaderEdgesIgnore();
+
+    /**
      * Suffixes used by the naming strategy to find test classes.
      * Default: {@code ["Test", "IT", "ITTest", "IntegrationTest"]}.
      *
@@ -528,7 +592,31 @@ public abstract class AffectedTestTask extends DefaultTask {
                 .includeImplementationTests(getIncludeImplementationTests().get())
                 .implementationNaming(getImplementationNaming().get())
                 .parallelDiscovery(getParallelDiscovery().getOrElse(true))
-                .kotlinEnabled(getKotlinEnabled().getOrElse(true));
+                .kotlinEnabled(getKotlinEnabled().getOrElse(true))
+                .headerEdgesEnabled(getHeaderEdgesEnabled().getOrElse(true))
+                .headerEdgesDepth(getHeaderEdgesDepth().getOrElse(1))
+                .headerEdgesMaxSiblings(getHeaderEdgesMaxSiblings().getOrElse(5));
+
+        // Issue #132 — pass the per-category opt-out and ignore-glob
+        // list through ONLY when the adopter set them. An unset
+        // property must NOT replace the builder's default list with
+        // an empty one, matching the existing {@code ignorePaths}
+        // pattern below: explicit empty list means "wipe defaults",
+        // unset means "keep defaults".
+        // Issue #132 — treat `[]` consistently across both knobs: an
+        // empty list means "no override, use defaults". headerEdgesIgnore
+        // ships with 16 framework-noise globs we don't want a stray
+        // `headerEdgesIgnore = []` in build.gradle to silently wipe; the
+        // documented contract is "extend not replace", so an empty list
+        // here matches the headerEdgesExclude semantics directly above.
+        if (getHeaderEdgesExclude().isPresent()
+                && !getHeaderEdgesExclude().get().isEmpty()) {
+            builder.headerEdgesExclude(new java.util.LinkedHashSet<>(getHeaderEdgesExclude().get()));
+        }
+        if (getHeaderEdgesIgnore().isPresent()
+                && !getHeaderEdgesIgnore().get().isEmpty()) {
+            builder.headerEdgesIgnore(getHeaderEdgesIgnore().get());
+        }
 
         if (getIgnorePaths().isPresent() && !getIgnorePaths().get().isEmpty()) {
             builder.ignorePaths(getIgnorePaths().get());
@@ -1512,6 +1600,15 @@ public abstract class AffectedTestTask extends DefaultTask {
         // and the buckets — see method Javadoc for the full table.
         appendKotlinMappingHints(lines, config, result);
 
+        // Issue #132 — headerEdges augmentation block. Skipped
+        // entirely when augmentation didn't fire (e.g. the strategy
+        // was disabled, EMPTY_DIFF, or no header-edge target was
+        // resolvable). The renderer relies on the engine threading
+        // a populated {@link HeaderEdgesStrategy.AugmentationResult}
+        // even on no-op paths, so the conditional here is the only
+        // "should we print this block?" gate the renderer needs.
+        appendHeaderEdgesBlock(lines, result);
+
         // Per-module dispatch preview — populated only for
         // SELECTED runs so the "what tasks will Gradle actually
         // kick off?" question can be answered directly from the
@@ -2191,6 +2288,164 @@ public abstract class AffectedTestTask extends DefaultTask {
         }
     }
 
+    /**
+     * Issue&nbsp;#132 — renders the headerEdges augmentation block
+     * of the {@code --explain} trace. The block reports four things
+     * the operator needs to answer "why did this MR's class set
+     * grow?":
+     *
+     * <ul>
+     *   <li>The augmented-set total ({@code +N classes from header
+     *       edges}) — the headline number that tells the operator
+     *       whether the strategy contributed at all.</li>
+     *   <li>A per-category preview of every {@link
+     *       io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus#ADDED}
+     *       edge, capped by {@link #EXPLAIN_SAMPLE_LIMIT} so a
+     *       framework-y diff can't spam the trace.</li>
+     *   <li>The list of types whose downward impl-walk was
+     *       suppressed by the sibling cap, with the cap value
+     *       inline so the operator doesn't have to cross-reference
+     *       the config knob.</li>
+     *   <li>A summary count of {@code IGNORED_BY_GLOB} /
+     *       {@code IGNORED_BY_CATEGORY} / {@code UNRESOLVED} edges,
+     *       so an unexpectedly small augmentation can be traced back
+     *       to a too-aggressive ignore-glob list or a missing
+     *       category opt-in.</li>
+     * </ul>
+     *
+     * <p>The whole block is skipped when augmentation didn't fire
+     * (no augmented types, no suppressed types, and no edges at
+     * all) — keeps the trace compact on the common case where the
+     * strategy adds nothing new.
+     */
+    static void appendHeaderEdgesBlock(List<String> lines, AffectedTestsResult result) {
+        io.affectedtests.core.discovery.HeaderEdgesStrategy.AugmentationResult he =
+                result.headerEdgesAugmentation();
+        if (he == null) return;
+        int added = he.augmentedTypes().size();
+        int suppressed = he.suppressedFromImplWalk().size();
+        List<io.affectedtests.core.discovery.HeaderEdgesStrategy.HeaderEdge> edges = he.edges();
+        if (edges.isEmpty() && suppressed == 0) {
+            return;
+        }
+        long addedEdges = edges.stream()
+                .filter(e -> e.status() == io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus.ADDED)
+                .count();
+        long byGlob = edges.stream()
+                .filter(e -> e.status() == io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus.IGNORED_BY_GLOB)
+                .count();
+        long byCategory = edges.stream()
+                .filter(e -> e.status() == io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus.IGNORED_BY_CATEGORY)
+                .count();
+        long unresolved = edges.stream()
+                .filter(e -> e.status() == io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus.UNRESOLVED)
+                .count();
+        long siblingCap = edges.stream()
+                .filter(e -> e.status() == io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus.SKIPPED_SIBLING_CAP)
+                .count();
+
+        lines.add("Header edges (issue #132):");
+        lines.add("  augmented:      " + added + " class(es) total, "
+                + addedEdges + " edge(s) added");
+        lines.add("  filtered:       "
+                + byGlob + " by ignore-glob, "
+                + byCategory + " by category opt-out, "
+                + unresolved + " unresolved, "
+                + siblingCap + " skipped by sibling-cap");
+
+        if (addedEdges > 0) {
+            lines.add("  added edges (sample):");
+            int shown = 0;
+            for (var edge : edges) {
+                if (edge.status() != io.affectedtests.core.discovery.HeaderEdgesStrategy.EdgeStatus.ADDED) continue;
+                if (shown >= EXPLAIN_SAMPLE_LIMIT) {
+                    lines.add("    … and " + (addedEdges - shown) + " more");
+                    break;
+                }
+                shown++;
+                String target = edge.targetFqn() != null ? edge.targetFqn() : edge.targetName();
+                lines.add("    " + LogSanitizer.sanitize(edge.sourceFqn())
+                        + " --[" + edge.category() + "]--> "
+                        + LogSanitizer.sanitize(target));
+            }
+        }
+
+        if (suppressed > 0) {
+            lines.add("  suppressed impl-walk (sibling cap):");
+            int shown = 0;
+            for (String fqn : he.suppressedFromImplWalk()) {
+                if (shown >= EXPLAIN_SAMPLE_LIMIT) {
+                    lines.add("    … and " + (suppressed - shown) + " more");
+                    break;
+                }
+                shown++;
+                lines.add("    " + LogSanitizer.sanitize(fqn));
+            }
+        }
+    }
+
+    /**
+     * Issue&nbsp;#132 — JSON counterpart to
+     * {@link #appendHeaderEdgesBlock}. Always emits the field
+     * ({@code "headerEdges": {...}}) so consumers can iterate
+     * without null-checking; the no-op case is the {@code added:0,
+     * suppressed:0, edges:[]} shape. Per-edge entries carry the
+     * resolved FQN when one is known and {@code null} for
+     * {@code UNRESOLVED} edges so dashboards can distinguish "we
+     * resolved it but suppressed it" from "we couldn't resolve it
+     * at all".
+     */
+    private static void appendHeaderEdgesJson(StringBuilder json, AffectedTestsResult result) {
+        io.affectedtests.core.discovery.HeaderEdgesStrategy.AugmentationResult he =
+                result.headerEdgesAugmentation();
+        json.append("\"headerEdges\":{");
+        if (he == null) {
+            appendJsonField(json, "added", 0); json.append(',');
+            appendJsonField(json, "suppressed", 0); json.append(',');
+            json.append("\"edges\":[]");
+            json.append("},");
+            return;
+        }
+        appendJsonField(json, "added", he.augmentedTypes().size()); json.append(',');
+        appendJsonField(json, "suppressed", he.suppressedFromImplWalk().size()); json.append(',');
+        json.append("\"suppressedFqns\":[");
+        boolean firstSup = true;
+        int supShown = 0;
+        for (String fqn : he.suppressedFromImplWalk()) {
+            if (supShown >= EXPLAIN_SAMPLE_LIMIT) break;
+            if (!firstSup) json.append(',');
+            firstSup = false;
+            supShown++;
+            json.append('"').append(jsonEscape(LogSanitizer.sanitize(fqn))).append('"');
+        }
+        json.append("],");
+
+        json.append("\"edges\":[");
+        boolean firstEdge = true;
+        int edgeShown = 0;
+        for (var edge : he.edges()) {
+            if (edgeShown >= EXPLAIN_SAMPLE_LIMIT) break;
+            if (!firstEdge) json.append(',');
+            firstEdge = false;
+            edgeShown++;
+            json.append('{');
+            appendJsonField(json, "source", LogSanitizer.sanitize(edge.sourceFqn())); json.append(',');
+            appendJsonField(json, "target",
+                    edge.targetFqn() == null ? null : LogSanitizer.sanitize(edge.targetFqn()));
+            json.append(',');
+            appendJsonField(json, "targetName", LogSanitizer.sanitize(edge.targetName())); json.append(',');
+            appendJsonField(json, "category", edge.category()); json.append(',');
+            appendJsonField(json, "status", edge.status().name());
+            if (edge.ignoreGlob() != null) {
+                json.append(',');
+                appendJsonField(json, "ignoreGlob", edge.ignoreGlob());
+            }
+            json.append('}');
+        }
+        json.append("]");
+        json.append("},");
+    }
+
     private static void appendSample(List<String> lines, String label, Set<String> files) {
         if (files.isEmpty()) {
             return;
@@ -2350,10 +2605,13 @@ public abstract class AffectedTestTask extends DefaultTask {
      * Schema version for {@link #renderExplainJson}. Bumped to 2 in
      * issue #42 to add the additive {@code discovery} block (parallel
      * flag, concurrency level, total wall time, per-strategy timings
-     * and contribution counts). All v1 fields remain present so
+     * and contribution counts). Bumped to 3 in issue #132 to add the
+     * additive {@code headerEdges} block (augmented-set total,
+     * suppressed-list, and per-edge entries with source / target /
+     * category / status). All v1 / v2 fields remain present so
      * existing consumers keep working without changes.
      */
-    static final int EXPLAIN_JSON_SCHEMA_VERSION = 2;
+    static final int EXPLAIN_JSON_SCHEMA_VERSION = 3;
 
     /**
      * Resolves and validates the {@code --explain-format} argument.
@@ -2520,6 +2778,14 @@ public abstract class AffectedTestTask extends DefaultTask {
             json.append('}');
         }
         json.append("]},");
+
+        // Issue #132 — headerEdges augmentation. Always present so
+        // consumers can iterate without null-checking; the empty-no-op
+        // case shows up as zero counts and an empty edges array.
+        // {@link #appendHeaderEdgesJson} owns the encoding so the
+        // text and JSON renderers can't drift apart on the field
+        // names.
+        appendHeaderEdgesJson(json, result);
 
         // The action matrix is cheap to serialise (5 entries) and
         // invaluable for "why did my explicit setting not win"

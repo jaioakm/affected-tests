@@ -23,7 +23,14 @@ class AffectedTestsConfigTest {
                 "Core builder default must be COMMITTED-ONLY as of the v1.9.14 → next-release flip");
         assertFalse(config.includeStaged(),
                 "Core builder default must be COMMITTED-ONLY as of the v1.9.14 → next-release flip");
-        assertEquals(Set.of("naming", "usage", "impl", "transitive"), config.strategies());
+        // Issue #132 ships headerEdges as a default-on strategy. The
+        // DSL knob {@code headerEdgesEnabled = false} is the
+        // documented one-flag kill switch; removing
+        // {@code "headerEdges"} from the strategies list explicitly
+        // is the secondary opt-out for adopters who already curate
+        // the strategies set.
+        assertEquals(Set.of("naming", "usage", "impl", "transitive", "headerEdges"),
+                config.strategies());
         // v2 raises the default from 2 to 4: real ctrl→svc→repo→mapper
         // chains sit 3-4 deep so 2 dropped coverage on zero-config.
         assertEquals(4, config.transitiveDepth());

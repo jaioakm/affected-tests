@@ -218,6 +218,17 @@ public final class AffectedTestsEngine {
      *                                 off, fast paths, etc.) so the
      *                                 renderer can poll without a null
      *                                 branch.
+     * @param headerEdgesAugmentation  issue&nbsp;#132 — header-edges
+     *                                 augmentation result feeding the
+     *                                 {@code --explain} text and JSON
+     *                                 renderers. Always non-null; the
+     *                                 {@link HeaderEdgesStrategy.AugmentationResult#identity}
+     *                                 sentinel covers every short-circuit
+     *                                 path (test-only fast path,
+     *                                 EMPTY_DIFF, headerEdges disabled,
+     *                                 etc.) so the renderer never has
+     *                                 to null-check the augmentation
+     *                                 field.
      */
     public record AffectedTestsResult(
             Set<String> testClassFqns,
@@ -233,7 +244,8 @@ public final class AffectedTestsEngine {
             EscalationReason escalationReason,
             Map<String, Set<String>> namingCrossPackageMatches,
             DiscoveryProfile discoveryProfile,
-            KotlinDiagnostics kotlinDiagnostics
+            KotlinDiagnostics kotlinDiagnostics,
+            HeaderEdgesStrategy.AugmentationResult headerEdgesAugmentation
     ) {
         public AffectedTestsResult {
             namingCrossPackageMatches = namingCrossPackageMatches == null
@@ -245,6 +257,45 @@ public final class AffectedTestsEngine {
             kotlinDiagnostics = kotlinDiagnostics == null
                     ? KotlinDiagnostics.EMPTY
                     : kotlinDiagnostics;
+            headerEdgesAugmentation = headerEdgesAugmentation == null
+                    ? HeaderEdgesStrategy.AugmentationResult.identity(
+                            changedProductionClasses == null
+                                    ? Set.of()
+                                    : changedProductionClasses)
+                    : headerEdgesAugmentation;
+        }
+
+        /**
+         * Backwards-compatible 14-arg constructor — preserves the
+         * pre-issue-#132 record shape (Kotlin diagnostics, no
+         * header-edges augmentation). Defaults
+         * {@code headerEdgesAugmentation} to the identity sentinel.
+         */
+        public AffectedTestsResult(
+                Set<String> testClassFqns,
+                Map<String, Path> testFqnToPath,
+                Set<String> changedFiles,
+                Set<String> changedProductionClasses,
+                Set<String> changedTestClasses,
+                Buckets buckets,
+                boolean runAll,
+                boolean skipped,
+                Situation situation,
+                Action action,
+                EscalationReason escalationReason,
+                Map<String, Set<String>> namingCrossPackageMatches,
+                DiscoveryProfile discoveryProfile,
+                KotlinDiagnostics kotlinDiagnostics
+        ) {
+            this(testClassFqns, testFqnToPath, changedFiles,
+                    changedProductionClasses, changedTestClasses,
+                    buckets, runAll, skipped, situation, action,
+                    escalationReason, namingCrossPackageMatches,
+                    discoveryProfile, kotlinDiagnostics,
+                    HeaderEdgesStrategy.AugmentationResult.identity(
+                            changedProductionClasses == null
+                                    ? Set.of()
+                                    : changedProductionClasses));
         }
 
         /**
@@ -302,7 +353,11 @@ public final class AffectedTestsEngine {
                     changedProductionClasses, changedTestClasses,
                     buckets, runAll, skipped, situation, action,
                     escalationReason, namingCrossPackageMatches,
-                    DiscoveryProfile.empty(), KotlinDiagnostics.EMPTY);
+                    DiscoveryProfile.empty(), KotlinDiagnostics.EMPTY,
+                    HeaderEdgesStrategy.AugmentationResult.identity(
+                            changedProductionClasses == null
+                                    ? Set.of()
+                                    : changedProductionClasses));
         }
 
         /**
@@ -329,7 +384,11 @@ public final class AffectedTestsEngine {
                     changedProductionClasses, changedTestClasses,
                     buckets, runAll, skipped, situation, action,
                     escalationReason, Map.of(),
-                    DiscoveryProfile.empty(), KotlinDiagnostics.EMPTY);
+                    DiscoveryProfile.empty(), KotlinDiagnostics.EMPTY,
+                    HeaderEdgesStrategy.AugmentationResult.identity(
+                            changedProductionClasses == null
+                                    ? Set.of()
+                                    : changedProductionClasses));
         }
     }
 
@@ -466,6 +525,7 @@ public final class AffectedTestsEngine {
         UsageStrategy usageStrategy = new UsageStrategy(config);
         ImplementationStrategy implStrategy = new ImplementationStrategy(config, namingStrategy, usageStrategy);
         TransitiveStrategy transitiveStrategy = new TransitiveStrategy(config, namingStrategy, usageStrategy);
+        HeaderEdgesStrategy headerEdgesStrategy = new HeaderEdgesStrategy(config);
 
         // try-with-resources on the {@link ProjectIndex}: when the
         // Kotlin AST gate is on (issue #76 PR #3+), the index owns a
@@ -481,29 +541,52 @@ public final class AffectedTestsEngine {
         // require touching this site.
         try (ProjectIndex index = ProjectIndex.build(projectDir, config)) {
 
+        // Issue #132 — header-edges augmentation runs BEFORE the four
+        // existing strategies so each downstream strategy sees the
+        // union of the diff and the header-edge-derived FQNs. The
+        // strategy short-circuits to the identity when {@code
+        // headerEdgesEnabled = false} or {@code STRATEGY_HEADER_EDGES}
+        // is not in the configured strategies list, so the cost of
+        // running this call site unconditionally is bounded to a
+        // single map allocation for adopters who opted out.
+        HeaderEdgesStrategy.AugmentationResult headerEdgesAugmentation;
+        if (config.strategies().contains(AffectedTestsConfig.STRATEGY_HEADER_EDGES)) {
+            headerEdgesAugmentation = headerEdgesStrategy.augment(productionClasses, index);
+        } else {
+            headerEdgesAugmentation =
+                    HeaderEdgesStrategy.AugmentationResult.identity(productionClasses);
+        }
+        Set<String> augmentedProductionClasses = headerEdgesAugmentation.augmentedTypes();
+        Set<String> suppressedFromImplWalk = headerEdgesAugmentation.suppressedFromImplWalk();
+        Set<String> implInputClasses = suppressedFromImplWalk.isEmpty()
+                ? augmentedProductionClasses
+                : minus(augmentedProductionClasses, suppressedFromImplWalk);
+
         // Issue #42: build the list of (name, callable) work items the
         // engine will dispatch; running them serially below or via a
         // small thread pool above is a uniform decision rather than a
-        // four-way `if` ladder. The per-strategy capture into
-        // {@link DiscoveryProfile} lives here so the parallel path
-        // and the serial path produce the same shape of diagnostic.
+        // five-way `if` ladder (naming / usage / impl / transitive +
+        // the issue-#132 headerEdges sibling-cap-aware impl input).
+        // The per-strategy capture into {@link DiscoveryProfile} lives
+        // here so the parallel path and the serial path produce the
+        // same shape of diagnostic.
         List<DiscoveryWorkItem> workItems = new ArrayList<>(4);
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_NAMING)) {
             workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_NAMING,
-                    () -> namingStrategy.discoverTests(productionClasses, index)));
+                    () -> namingStrategy.discoverTests(augmentedProductionClasses, index)));
         }
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_USAGE)) {
             workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_USAGE,
-                    () -> usageStrategy.discoverTests(productionClasses, index)));
+                    () -> usageStrategy.discoverTests(augmentedProductionClasses, index)));
         }
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_IMPL)) {
             workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_IMPL,
-                    () -> implStrategy.discoverTests(productionClasses, index)));
+                    () -> implStrategy.discoverTests(implInputClasses, index)));
         }
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_TRANSITIVE)
                 && config.transitiveDepth() > 0) {
             workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_TRANSITIVE,
-                    () -> transitiveStrategy.discoverTests(productionClasses, index)));
+                    () -> transitiveStrategy.discoverTests(augmentedProductionClasses, index)));
         }
         DiscoveryProfile profile = runDiscovery(workItems, candidateTests, config);
 
@@ -559,7 +642,7 @@ public final class AffectedTestsEngine {
             if (action == Action.FULL_SUITE || action == Action.SKIPPED) {
                 return emptyResult(Situation.DISCOVERY_INCOMPLETE, action, changedFiles,
                         mapping.productionClasses(), mapping.testClasses(), buckets,
-                        index.kotlinDiagnostics());
+                        index.kotlinDiagnostics(), headerEdgesAugmentation);
             }
             // SELECTED: honour the situation but fall through to the
             // shared empty/selected tail below. The tail now picks the
@@ -588,7 +671,7 @@ public final class AffectedTestsEngine {
                     emptySituation, action);
             return emptyResult(emptySituation, action, changedFiles,
                     mapping.productionClasses(), mapping.testClasses(), buckets,
-                    index.kotlinDiagnostics());
+                    index.kotlinDiagnostics(), headerEdgesAugmentation);
         }
 
         log.info("=== Result: {} affected test classes ({}) ===",
@@ -622,7 +705,8 @@ public final class AffectedTestsEngine {
                 EscalationReason.NONE,
                 survivingCrossPackage,
                 profile,
-                index.kotlinDiagnostics()
+                index.kotlinDiagnostics(),
+                headerEdgesAugmentation
         );
         }
     }
@@ -756,7 +840,7 @@ public final class AffectedTestsEngine {
                                             Buckets buckets) {
         return emptyResult(situation, action, changedFiles,
                 changedProduction, changedTests, buckets,
-                KotlinDiagnostics.EMPTY);
+                KotlinDiagnostics.EMPTY, null);
     }
 
     /**
@@ -773,13 +857,21 @@ public final class AffectedTestsEngine {
      * etc.) keep the no-arg overload and pass {@link
      * KotlinDiagnostics#EMPTY} because no parser ran in those
      * branches.
+     *
+     * <p>The {@code headerEdgesAugmentation} parameter carries the
+     * issue-#132 augmentation — non-null on the parse-failure /
+     * discovery-empty branches that already ran the augmentation
+     * step, null on every outside-the-index short-circuit (in
+     * which case the {@link AffectedTestsResult} record defaults
+     * it to the identity sentinel).
      */
     private AffectedTestsResult emptyResult(Situation situation, Action action,
                                             Set<String> changedFiles,
                                             Set<String> changedProduction,
                                             Set<String> changedTests,
                                             Buckets buckets,
-                                            KotlinDiagnostics kotlinDiagnostics) {
+                                            KotlinDiagnostics kotlinDiagnostics,
+                                            HeaderEdgesStrategy.AugmentationResult headerEdgesAugmentation) {
         boolean runAll = action == Action.FULL_SUITE;
         // SELECTED on an ambiguous branch is treated as "skipped" for the
         // Gradle task's wiring — there is nothing to dispatch either way —
@@ -801,7 +893,8 @@ public final class AffectedTestsEngine {
                 escalationReason(situation, action),
                 Map.of(),
                 DiscoveryProfile.empty(),
-                kotlinDiagnostics == null ? KotlinDiagnostics.EMPTY : kotlinDiagnostics
+                kotlinDiagnostics == null ? KotlinDiagnostics.EMPTY : kotlinDiagnostics,
+                headerEdgesAugmentation
         );
     }
 
@@ -846,6 +939,22 @@ public final class AffectedTestsEngine {
             }
         }
         return filtered;
+    }
+
+    /**
+     * Set difference preserving insertion order — used by the engine
+     * to compute the {@code impl} strategy's input as the augmented
+     * set minus the issue-#132 sibling-cap-suppressed types. Pulled
+     * out of the call site so the intent reads cleanly and the
+     * {@link LinkedHashSet} contract stays uniform across every
+     * derived set in the engine.
+     */
+    private static Set<String> minus(Set<String> source, Set<String> exclude) {
+        Set<String> out = new LinkedHashSet<>(source.size());
+        for (String fqn : source) {
+            if (!exclude.contains(fqn)) out.add(fqn);
+        }
+        return out;
     }
 
     private static EscalationReason escalationReason(Situation situation, Action action) {

@@ -9,8 +9,50 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Synced the README `--explain --explain-format=json` sample with
-  the shipped schema v2 output, including the additive `discovery`
-  block and schema-versioning policy for consumers (issue #104).
+  the shipped schema v3 output, including the additive `discovery`
+  and `headerEdges` blocks plus the schema-versioning policy for
+  consumers (issue #104).
+
+### Added — `headerEdges` discovery strategy (issue #132)
+
+Adds a fifth, default-on discovery strategy that closes the Spring DI
+Gap: a change to a concrete `class StripeGateway implements
+PaymentGateway` now selects `PaymentGatewayTest` (the interface
+contract test) even when no source file source-imports `StripeGateway`
+directly. Pre-issue-#132 the four existing strategies (naming /
+usage / impl / transitive) walked only source-level type references
+in test bodies and downward-subtype edges from changed classes —
+none of them walked from a changed concrete class UP to its
+supertypes or OUT to its header-declared types, so DI-only edges
+were silently invisible.
+
+The strategy treats anything that appears in a class declaration
+before the opening `{` as part of the class's identity, splits it
+across six categories (`extends`, `implements`, `permits`,
+`type-bounds`, `record-components`, class-level `annotations`),
+resolves the simple names to project FQNs via a four-tier walk
+(non-wildcard imports → same-package lookup → wildcard imports →
+project-wide unambiguous match), then adds the resolved FQNs to the
+changed-class set BEFORE the four pre-existing strategies run.
+
+Three layered safety contracts keep selection bounded: a default
+ignore-glob list mutes JDK / Spring / JUnit / Mockito / Kotlin /
+Lombok stdlib noise; a depth bound (default 1, clamped to 2)
+prevents exponential walks; a sibling cap (default 5) suppresses the
+downward impl-walk from header-edge-added types with more than N
+direct subtypes — the surgical fix for the `BaseController` (52
+subclasses) explosion case.
+
+Five new DSL knobs expose the strategy (`headerEdgesEnabled`,
+`headerEdgesExclude`, `headerEdgesDepth`, `headerEdgesMaxSiblings`,
+`headerEdgesIgnore`). `--explain` text and JSON both gain a
+`headerEdges` block listing the augmented count, per-edge entries
+with category labels, and sibling-cap suppressions. The JSON schema
+version bumps v2 → v3 (additive; v2 fields unchanged).
+`ProjectIndexCache.SCHEMA_VERSION` bumps 4 → 5 to invalidate warm
+caches whose `FileMetadataRow` is missing the new HeaderEdges
+column, and every new knob feeds into `configHash` so a knob flip
+across consecutive runs forces a clean rescan.
 
 ### Added — Phase 3 Groovy AST tech plan (issue #96 / #47)
 

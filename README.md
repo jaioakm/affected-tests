@@ -71,33 +71,50 @@ Action matrix (situation → action [source]):
 
 Emits the same decision trace as a single-line JSON object on `lifecycle()` instead of the human-readable text block. Designed for dashboard / telemetry pipelines that previously had to regex-parse the text trace and broke whenever the trace shape evolved.
 
-Schema (carried in the `version` field; new fields may be added additively while `version` stays at `2`):
+Schema (carried in the `version` field; new fields are added additively, the version bumps when fields are renamed, removed, or retyped):
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "baseRef": "origin/master",
   "mode": {"configured": "AUTO", "effective": "LOCAL"},
   "changedFiles": 3,
   "buckets": {"ignored": 1, "outOfScope": 0, "production": 1, "test": 0, "unmapped": 1},
   "samples": {
     "ignored": ["README.md"],
-    "production": ["src/main/java/com/example/Foo.java"],
+    "production": ["src/main/java/com/example/StripeGateway.java"],
     "unmapped": ["build.gradle"]
   },
-  "situation": "UNMAPPED_FILE",
-  "action": {"name": "FULL_SUITE", "source": "MODE_DEFAULT"},
-  "outcome": {"kind": "FULL_SUITE", "selectedClassCount": 0, "escalationReason": "RUN_ALL_ON_NON_JAVA_CHANGE"},
-  "modules": [],
+  "situation": "DISCOVERY_SUCCESS",
+  "action": {"name": "SELECTED", "source": "EXPLICIT"},
+  "outcome": {"kind": "SELECTED", "selectedClassCount": 2},
   "discovery": {
-    "parallelEnabled": true,
-    "concurrencyLevel": 4,
-    "totalMillis": 13,
-    "perStrategy": [
-      {"name": "naming", "millis": 2, "tests": 2},
-      {"name": "transitive", "millis": 11, "tests": 3}
+    "totalMs": 13,
+    "threads": 4,
+    "strategies": {
+      "naming":     {"ms": 0,  "tests": 1},
+      "usage":      {"ms": 12, "tests": 2, "dominant": true},
+      "impl":       {"ms": 12, "tests": 1},
+      "transitive": {"ms": 2,  "tests": 0}
+    }
+  },
+  "headerEdges": {
+    "added": 2,
+    "suppressed": 0,
+    "suppressedFqns": [],
+    "edges": [
+      {
+        "source": "com.example.StripeGateway",
+        "target": "com.example.PaymentGateway",
+        "targetName": "PaymentGateway",
+        "category": "implements",
+        "status": "ADDED"
+      }
     ]
   },
+  "modules": [
+    {"path": ":test", "testClasses": ["com.example.PaymentGatewayTest", "com.example.PaymentGatewayContractTest"]}
+  ],
   "actionMatrix": {
     "EMPTY_DIFF":              {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
     "ALL_FILES_IGNORED":       {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
@@ -109,6 +126,8 @@ Schema (carried in the `version` field; new fields may be added additively while
   }
 }
 ```
+
+Schema history: `v=1` (initial); `v=2` adds the `discovery` block (issue #76, parallel-strategy timing); `v=3` adds the `headerEdges` block (issue #132, header-edges strategy diagnostics).
 
 Field-by-field semantics:
 
@@ -124,7 +143,8 @@ Field-by-field semantics:
 | `action` | object | `name` is one of `SELECTED` / `FULL_SUITE` / `SKIPPED`; `source` says which configuration tier resolved it (`MODE_DEFAULT` / `EXPLICIT`). |
 | `outcome` | object | `kind` mirrors `action.name`; `selectedClassCount` is meaningful on `SELECTED` runs (and `0` elsewhere); `escalationReason` is the same enum the text trace renders in the `Outcome:` line. |
 | `modules` | array | One entry per dispatched `:module:test` task (empty on non-`SELECTED` runs). Each entry carries the canonical task path and the full FQN list — no truncation, since this is the actionable downstream-routing surface. |
-| `discovery` | object | Always present. Carries discovery execution metadata: whether parallel discovery was enabled, the configured concurrency level, total discovery wall time in milliseconds, and per-strategy `{name, millis, tests}` entries. Empty-diff / test-only fast paths emit zero defaults and an empty `perStrategy` array. |
+| `discovery` | object | Always present. Carries discovery execution metadata: total wall time (`totalMs`), worker count (`threads`), and per-strategy timing / contribution details under `strategies`. Empty-diff / test-only fast paths emit zero defaults and an empty strategies object. |
+| `headerEdges` | object | Always present. Carries the header-edge augmentation summary added in schema v3: augmented type count (`added`), sibling-cap suppression count (`suppressed`), sampled suppressed FQNs, and per-edge source / target / category / status entries. The no-op shape is zero counts plus empty arrays. |
 | `actionMatrix` | object | Every `Situation` enum value maps to its `{action, source}` pair. Pinned in tests so a future engine that adds a situation also has to update the JSON renderer. |
 
 Fields may be added without bumping `version`. Removing or renaming fields, changing field types, or changing existing field semantics requires a version bump. Consumers should parse defensively by ignoring unknown fields.
@@ -135,7 +155,7 @@ That's it. With zero config, the plugin will:
 
 - Diff against `origin/master` (including uncommitted + staged changes).
 - Route each changed file through one of five buckets: **ignored** (`*.md`, LICENSE, CHANGELOG, images, `**/generated/**`), **out-of-scope**, **production `.java`**, **test `.java`**, or **unmapped** (everything else, e.g. `application.yml`).
-- Pick a discovery strategy — **naming**, **usage**, **impl**, **transitive** — and merge their results into one test set.
+- Pick a discovery strategy — **naming**, **usage**, **impl**, **transitive**, **headerEdges** — and merge their results into one test set.
 - Follow 4 levels of transitive dependencies (tuned for typical controller → service → repository chains).
 - Fall through to the full suite if it encounters an unmapped file, so a YAML/Gradle/Liquibase diff never ships without tests.
 
@@ -320,8 +340,52 @@ affectedTests {
 
     // ---------------- Discovery tuning ----------------
 
-    // Discovery strategies: "naming", "usage", "impl", "transitive" (default: all four)
-    strategies = ["naming", "usage", "impl", "transitive"]
+    // Discovery strategies: "naming", "usage", "impl", "transitive",
+    // "headerEdges" (default: all five). "headerEdges" closes the
+    // Spring DI Gap — a change to a concrete impl whose interface is
+    // consumed only via DI now selects the interface's contract tests.
+    // See the "headerEdges" row in the strategies table below for the
+    // full rationale and safety contracts.
+    strategies = ["naming", "usage", "impl", "transitive", "headerEdges"]
+
+    // ---------------- headerEdges tuning (issue #132) ----------------
+
+    // One-flag kill switch. Default true; flip to false to revert to
+    // pre-issue-#132 behaviour without un-listing the strategy.
+    headerEdgesEnabled = true
+
+    // Per-category opt-out. Valid entries: "extends", "implements",
+    // "permits", "type-bounds", "record-components", "annotations".
+    // Default empty (every category on). Most common opt-out:
+    // ["annotations"] for codebases with many custom class-level
+    // annotations that carry no test-relevant behaviour.
+    headerEdgesExclude = []
+
+    // Walk depth: 1 (default) walks immediate header targets only,
+    // 2 walks one more hop. Clamped to [0, 2]; higher values rapidly
+    // approach FULL_SUITE on real codebases. 0 is equivalent to the
+    // kill switch.
+    headerEdgesDepth = 1
+
+    // Sibling cap on the impl-walk explosion vector. When a
+    // header-edge-added type has more than N direct subtypes,
+    // ImplementationStrategy's downward walk from THAT added type is
+    // suppressed. The added type still participates in
+    // naming / usage / transitive — only the impl-walk explosion is
+    // killed. Default 5; set to 0 to suppress every downward walk
+    // from a header-edge-added type. Motivating case:
+    // BaseController extends with 52 subclasses — without the cap,
+    // a touch of any PaymentController would select every
+    // *ControllerTest in the codebase.
+    headerEdgesMaxSiblings = 5
+
+    // FQN globs (java.nio glob syntax) for header-edge targets whose
+    // contribution is suppressed. Default list mutes JDK / Spring /
+    // JUnit / Mockito / Kotlin / Lombok stdlib noise that pollutes
+    // selection without contributing signal. Setting an explicit list
+    // here REPLACES the default — concatenate with the default if you
+    // only want to ADD a glob.
+    headerEdgesIgnore = ["com.adopter.framework.**"]
 
     // Transitive dependency depth — used when the "transitive" strategy is enabled.
     // Raised from 2 → 4 in v2 because typical Spring controller→service→repo
@@ -395,7 +459,7 @@ The pipeline is five stages: **detect** what changed, **bucket** each path (igno
 
 ### Discovery Strategies
 
-All four strategies run against every changed production class. Their results are merged (union), so a test is run if **any** strategy identifies it. The goal is maximum coverage — running a few extra tests is always preferable to missing one.
+All five strategies run against every changed production class. Their results are merged (union), so a test is run if **any** strategy identifies it. The goal is maximum coverage — running a few extra tests is always preferable to missing one.
 
 | Strategy | What it does | Example |
 |----------|-------------|---------|
@@ -403,6 +467,7 @@ All four strategies run against every changed production class. Their results ar
 | **usage** | Parses every test file with JavaParser and checks whether it references any changed class. Uses a two-tier approach: **(1)** direct import match — if the test has `import com.example.FooService;`, it's affected regardless of how it uses the class; **(2)** type-reference scan for wildcard imports (`import com.example.*`) and same-package usage (no import needed). Catches fields, method parameters, return types, constructor calls, generics, and casts. | `BarModel` changed → finds `BarValidatorTest` (imports it), `BazMapperTest` (same package, uses it as field type) |
 | **impl** | When an interface or base class changes, scans all production source files to find classes that `extends` or `implements` the changed type (via AST) and classes following the `*Impl` or `Default*` naming convention. Then re-runs the naming and usage strategies on those implementations. | `FooService` (interface) changed → finds `FooServiceImpl` and `DefaultFooService` → finds `FooServiceImplTest` / `DefaultFooServiceTest` |
 | **transitive** | Builds a reverse dependency map of all production classes: for each class, which other classes depend on it (via field types). When a class changes, walks this "used-by" graph N levels deep (configurable, default 4, max 5) to find consumers. Then runs naming + usage on those consumers. | `BazGateway` changed → `FooService` uses it (depth 1) → `OrdersController` uses `FooService` (depth 2) → finds both tests via naming |
+| **headerEdges** *(issue [#132](https://github.com/vedanthvdev/affected-tests/issues/132))* | Closes the Spring DI Gap. Walks each changed class's header — anything before the opening `{` — and augments the changed-class set with the resolved targets BEFORE the four pre-existing strategies run. Six categories: `extends`, `implements`, `permits`, generic `type-bounds`, `record-components`, class-level `annotations`. Three safety layers: default ignore-globs mute JDK / Spring / JUnit / Mockito / Kotlin / Lombok noise; a depth bound (default 1, max 2) prevents transitive explosions; a sibling cap (default 5) suppresses the impl-walk explosion from over-connected types like `BaseController` (52 subclasses). Tune via `headerEdgesEnabled` / `headerEdgesExclude` / `headerEdgesDepth` / `headerEdgesMaxSiblings` / `headerEdgesIgnore` DSL knobs; the `--explain` trace gains a `Header edges (issue #132):` block listing every fired edge with its category label. | `StripeGateway implements PaymentGateway` changed → adds `PaymentGateway` to the changed-class set → naming finds `PaymentGatewayTest` (the interface contract test that previously was silently missed because no source file source-imports `StripeGateway`) |
 
 ### How scanning works
 

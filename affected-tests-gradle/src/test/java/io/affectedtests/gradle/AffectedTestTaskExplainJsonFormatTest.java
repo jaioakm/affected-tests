@@ -57,12 +57,13 @@ class AffectedTestTaskExplainJsonFormatTest {
 
         String json = AffectedTestTask.renderExplainJson(config, result, Map.of());
 
-        assertTrue(json.contains("\"version\":2"),
-                "Schema version must be present and pinned at v2 — "
-                        + "issue #42 bumped from v1 to add the additive "
-                        + "discovery block; all v1 fields remain present. "
-                        + "Consumers need the version to detect future "
-                        + "additions. Got: " + json);
+        assertTrue(json.contains("\"version\":3"),
+                "Schema version must be present and pinned at v3 — "
+                        + "issue #42 bumped v1 → v2 to add the discovery "
+                        + "block; issue #132 bumped v2 → v3 to add the "
+                        + "additive headerEdges block. All earlier fields "
+                        + "remain present. Consumers need the version to "
+                        + "detect future additions. Got: " + json);
         assertTrue(json.contains("\"baseRef\":\"origin/master\""),
                 "Base ref must be carried so dashboards can correlate "
                         + "traces against the right merge target. Got: " + json);

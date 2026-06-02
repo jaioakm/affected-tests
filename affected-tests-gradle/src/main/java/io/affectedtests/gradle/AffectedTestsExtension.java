@@ -137,6 +137,112 @@ public abstract class AffectedTestsExtension {
     public abstract Property<Boolean> getKotlinEnabled();
 
     /**
+     * Issue&nbsp;#132 — kill switch for the {@code headerEdges}
+     * discovery strategy. {@code true} (default) walks class-header
+     * type references (extends / implements / permits / generic
+     * bounds / record components / class-level annotations) and
+     * augments the changed-class set with the resolved targets
+     * before the four pre-existing strategies (naming / usage /
+     * impl / transitive) run. {@code false} disables every
+     * category at once and reverts plugin behaviour to byte-for-byte
+     * identical to pre-issue-#132. Adopters who want per-category
+     * opt-out use {@link #getHeaderEdgesExclude()} instead so the
+     * rest of the strategy keeps firing.
+     *
+     * @return the headerEdges-enabled property
+     */
+    public abstract Property<Boolean> getHeaderEdgesEnabled();
+
+    /**
+     * Issue&nbsp;#132 — header-edge categories whose contributions
+     * are skipped during augmentation. Adopters EXCLUDE (not
+     * include) — every category is on by default; this list is the
+     * surgical opt-out. Valid entries: {@code "extends"},
+     * {@code "implements"}, {@code "permits"}, {@code "type-bounds"},
+     * {@code "record-components"}, {@code "annotations"}. Entries
+     * are case-insensitive; unknown entries are rejected at config
+     * time (a silent ignore of a typo would leave the adopter
+     * expecting their opt-out applied when it wasn't).
+     *
+     * <p>Common opt-out shapes:
+     * <ul>
+     *   <li>{@code headerEdgesExclude = ["annotations"]} — adopter
+     *       uses many custom class-level annotations that don't
+     *       carry test-relevant behaviour. Most frequent opt-out.</li>
+     *   <li>{@code headerEdgesExclude = ["record-components"]} —
+     *       DTO-heavy codebases where record components are pure
+     *       data carriers.</li>
+     * </ul>
+     *
+     * @return the headerEdgesExclude list property
+     */
+    public abstract ListProperty<String> getHeaderEdgesExclude();
+
+    /**
+     * Issue&nbsp;#132 — how many header-edge hops the strategy
+     * walks from each changed class. {@code 1} (default) walks the
+     * immediate header-declared types only; {@code 2} walks one
+     * more level. Clamped to {@code [0, 2]} at the builder gate;
+     * higher values rapidly approach {@code FULL_SUITE} selection
+     * on real codebases because almost every concrete class
+     * transitively reaches {@code Object}'s consumer base.
+     * {@code 0} is treated identically to
+     * {@link #getHeaderEdgesEnabled() headerEdgesEnabled = false}.
+     *
+     * @return the headerEdges depth property
+     */
+    public abstract Property<Integer> getHeaderEdgesDepth();
+
+    /**
+     * Issue&nbsp;#132 — sibling-cap on the explosion vector. When
+     * a header-edge-added type has more direct subtypes than this
+     * value, the {@code impl} strategy's downward walk from THAT
+     * added type is suppressed; the added type still contributes
+     * via naming / usage / transitive. Default: {@code 5}.
+     *
+     * <p>Motivating case: {@code PaymentController extends
+     * BaseController} with {@code BaseController} owning 52
+     * subclasses. Without the cap, walking {@code extends} would
+     * add {@code BaseController} to the changed set and the impl
+     * strategy would then walk DOWN through all 52 subtypes,
+     * selecting every {@code *ControllerTest} in the codebase.
+     * The cap is the surgical fix — {@code BaseController} still
+     * adds {@code BaseControllerTest} via naming, but the 52-way
+     * fan-out is skipped and recorded in {@code --explain} as
+     * {@code SKIPPED downward impl-walk from BaseController (52
+     * subtypes > headerEdgesMaxSiblings=5)}.
+     *
+     * <p>Set to {@code 0} to suppress every downward walk from a
+     * header-edge-added type. Setting it negative is rejected at
+     * config time.
+     *
+     * @return the headerEdgesMaxSiblings property
+     */
+    public abstract Property<Integer> getHeaderEdgesMaxSiblings();
+
+    /**
+     * Issue&nbsp;#132 — globs (Java-style {@code **}-prefixed FQN
+     * patterns) for types whose header-edge contributions are
+     * ignored. Default covers framework / JDK / Lombok / JUnit /
+     * Mockito / Kotlin / Groovy types that pollute selection
+     * without contributing signal: {@code java.lang.**},
+     * {@code java.util.**}, {@code org.springframework.**},
+     * {@code org.junit.**}, {@code lombok.**}, {@code kotlin.**},
+     * {@code groovy.lang.**}, and the {@code javax} / {@code jakarta}
+     * equivalents.
+     *
+     * <p>When unset, the core {@code AffectedTestsConfig} default
+     * list applies. Adopters typically EXTEND rather than replace:
+     * setting an explicit list overrides the default entirely, so
+     * a project that wants to add a single extra glob should
+     * concatenate with the default rather than supply only the
+     * one entry.
+     *
+     * @return the headerEdgesIgnore list property
+     */
+    public abstract ListProperty<String> getHeaderEdgesIgnore();
+
+    /**
      * Test class suffixes used by the naming strategy.
      * Default: {@code ["Test", "IT", "ITTest", "IntegrationTest"]}.
      *
