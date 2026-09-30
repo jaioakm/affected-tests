@@ -1,0 +1,23 @@
+name: tqqq-nav-transfer-temp
+on:
+  push:
+    paths:
+      - '.github/workflows/tqqq-nav-transfer-temp.yml'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact ProShares CSV
+        run: |
+          set -euo pipefail
+          curl -fL 'https://accounts.profunds.com/etfdata/ByFund/TQQQ-historical_nav.csv' -o TQQQ-historical_nav.csv
+          wc -c TQQQ-historical_nav.csv
+          sha256sum TQQQ-historical_nav.csv
+      - name: Upload exact bytes
+        uses: actions/upload-artifact@v4
+        with:
+          name: tqqq-nav-exact
+          path: TQQQ-historical_nav.csv
+          if-no-files-found: error
+          compression-level: 0
